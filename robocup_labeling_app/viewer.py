@@ -4225,7 +4225,7 @@ class LabelingWindow(QMainWindow):
             "Detector hook: baseline recorded for "
             f"{len(self.scene_watch_processed)} existing scene folder(s); "
             + (
-                "watch root classes.txt will be used for new scenes"
+                "app-folder classes.txt will be used for new scenes"
                 if autolabel_mode != "tshirt"
                 else "tshirt autolabeling mode will use OpenRouter keypoint extraction"
             )
@@ -4266,10 +4266,10 @@ class LabelingWindow(QMainWindow):
         classes_file: Path | None = None
         class_specs: list[VocabularyClassSpec] = []
         if autolabel_mode != "tshirt":
-            classes_file = self.scene_watch_root / "classes.txt"
+            classes_file = self.app_root / "robocup_labeling_app" / "classes.txt"
             if not classes_file.exists():
                 self.scene_watch_result_label.setText(
-                    f"Detector hook: waiting for shared classes file at {classes_file}"
+                    f"Detector hook: waiting for app classes file at {classes_file}"
                 )
                 self._update_scene_watch_widgets()
                 return
@@ -4277,7 +4277,7 @@ class LabelingWindow(QMainWindow):
             class_specs = self._parse_scene_classes_file(classes_file)
             if not class_specs:
                 self.scene_watch_result_label.setText(
-                    f"Detector hook: shared classes file at {classes_file} is empty or invalid"
+                    f"Detector hook: app classes file at {classes_file} is empty or invalid"
                 )
                 self._update_scene_watch_widgets()
                 return
@@ -4601,13 +4601,9 @@ class LabelingWindow(QMainWindow):
         request: OpenVocabularyDetectionRequest,
         autolabel_mode: str = "objects",
     ) -> Path:
-        if self.scene_watch_root is not None:
-            output_root = self.scene_watch_root / "output" / request.scene_name
-        else:
-            output_root = request.scene_path / "output"
         if autolabel_mode == "tshirt":
-            return output_root / "annotations_coco_keypoints.json"
-        return output_root / "annotations_coco_objects.json"
+            return request.image_dir / "coco_annotations_auto_keypoints.json"
+        return request.image_dir / "coco_annotations_auto.json"
 
     def load_image_folder(self, folder: Path) -> None:
         image_paths = sorted(

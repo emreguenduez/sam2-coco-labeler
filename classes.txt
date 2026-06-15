@@ -1,0 +1,45 @@
+almdudler round softdrink bottle with red cover containing golden liquid
+apple_juice bottle filled with apple juice
+coffee coffee drink in a white bottle
+coke red can of cola
+fanta yellow can of fanta
+ice_tea green can of ice tea
+milk blue tetra pak containing cream
+tea light blue packet of tea bags
+cup red cup
+fork fork with red handle
+spoon spoon with red handle
+knife knife with red handle
+plate red plate
+bowl red bowl
+ketchup red bottle of ketchup
+macncheese blue pack of maccaroni
+mayonaise yellow tube containing mayonaise
+mustard yellow mustard bottle with green cap
+olive_oil transparent olive oil bottle with yellow liquid
+sandwich pack of sandwiches
+sausages red can of sausages
+sugar small blue pack of sugar
+cloth cleaning cloth
+dish_soap bottle of dish soap containing green liquid
+dishwasher_tab dishwasher tab
+sponge yellow cleaning sponge
+apple apple
+banana yellow banana
+lemon yellow lemon
+orange orange
+peach peach
+pear pear
+plum plum
+strawberry strawberry
+brezels snack brezels in a red plastic pack
+cereals small blue pack of cereals with an animal on the front cover
+cheezit big red box containing snacks
+cornflakes yellow pack of cornflakes
+nuts a brown round can containing nuts
+pringles a red pringles can
+tictac an empty tictac container
+candle small yellow tea candle
+crayons yellow pack containing crayons
+lego pink lego brick
+glue white bottle of glue with orange cap
