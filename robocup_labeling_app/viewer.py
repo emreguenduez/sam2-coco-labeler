@@ -5269,12 +5269,22 @@ class LabelingWindow(QMainWindow):
         if not accepted or not label.strip() or label.strip() == obj.label:
             return
 
+        new_label = label.strip()
         self._record_history_state()
-        obj.label = label.strip()
-        self.last_object_label = obj.label
+        renamed_count = 0
+        for image_path in self.image_paths:
+            image_key = str(image_path)
+            for frame_obj in self.object_annotations.get(image_key, []):
+                if frame_obj.object_id != obj.object_id:
+                    continue
+                if frame_obj.label != new_label:
+                    frame_obj.label = new_label
+                    renamed_count += 1
+
+        self.last_object_label = new_label
         self._sync_canvas_and_lists()
         self.status_bar.showMessage(
-            f"Renamed object #{obj.object_id} to {obj.label}"
+            f"Renamed object #{obj.object_id} to {new_label} in {renamed_count} annotation(s)"
         )
 
     def _refresh_timeline_panel(self) -> None:
