@@ -1458,6 +1458,14 @@ class Sam2ImageEngine:
 
         candidates = [
             (
+                "configs/sam2.1/sam2.1_hiera_l.yaml",
+                "sam2.1_hiera_large.pt",
+                [
+                    self.workspace_root / "groundedsam2/checkpoints/sam2.1_hiera_large.pt",
+                    self.workspace_root / "ros2_ws/src/sam2_ros/data/sam2.1_hiera_large.pt",
+                ],
+            ),
+            (
                 "configs/sam2.1/sam2.1_hiera_b+.yaml",
                 "sam2.1_hiera_base_plus.pt",
                 [
@@ -1479,14 +1487,6 @@ class Sam2ImageEngine:
                 [
                     self.workspace_root / "groundedsam2/checkpoints/sam2.1_hiera_tiny.pt",
                     self.workspace_root / "ros2_ws/src/sam2_ros/data/sam2.1_hiera_tiny.pt",
-                ],
-            ),
-            (
-                "configs/sam2.1/sam2.1_hiera_l.yaml",
-                "sam2.1_hiera_large.pt",
-                [
-                    self.workspace_root / "groundedsam2/checkpoints/sam2.1_hiera_large.pt",
-                    self.workspace_root / "ros2_ws/src/sam2_ros/data/sam2.1_hiera_large.pt",
                 ],
             ),
         ]
