@@ -1,7 +1,13 @@
-# RoboCup Labeling
+# sam2-coco-labeler
 
 A lightweight desktop app for labeling RoboCup images with SAM2-assisted object
 masks and keypoints, exported as COCO. The interface is inspired by X-AnyLabeling.
+
+![Objects segmented with SAM2 and labeled on one photo](docs/screenshot-masks.jpg)
+
+| Zoomed in to check mask edges | Object timeline across all frames |
+|---|---|
+| ![Zoomed-in canvas](docs/screenshot-zoom.jpg) | ![Timeline panel](docs/screenshot-timeline.jpg) |
 
 ## Features
 
@@ -34,6 +40,9 @@ python3 run_app.py
 ## macOS setup (Apple Silicon)
 
 ```bash
+git clone https://github.com/emreguenduez/sam2-coco-labeler.git
+cd sam2-coco-labeler
+git clone https://github.com/MCG-NJU/SAM2-Plus.git   # SAM2 code; add a SAM2 checkpoint, see Notes
 ./setup_mac.sh      # once: creates .venv with PyTorch, PyQt6, SAM2 deps
 ./start_app.sh      # every time
 ```
@@ -67,7 +76,8 @@ The autosave is overwritten as you work; use `Export` for a finished copy.
 ## Notes
 
 - Supported image formats: `.jpg`, `.jpeg`, `.png`, `.bmp`, `.gif`, `.tif`, `.tiff`, `.webp`, `.heic`, `.heif` (HEIC needs `pillow-heif`, which `setup_mac.sh` installs)
-- SAM2 mode expects the local `SAM2-Plus` bundle and a compatible SAM2 checkpoint already available in the workspace
+- SAM2 mode expects the `SAM2-Plus` checkout ([MCG-NJU/SAM2-Plus](https://github.com/MCG-NJU/SAM2-Plus)) in the repository root and a SAM2.1 checkpoint (e.g. `sam2.1_hiera_large.pt`) in `SAM2-Plus/checkpoints/`, or set `ROBOCUP_SAM2_CHECKPOINT` and `ROBOCUP_SAM2_CONFIG`
+- CoTracker expects a checkout of [facebookresearch/co-tracker](https://github.com/facebookresearch/co-tracker) in the repository root
 - Set `AUTOLABELING_MODE=keypoints` and `OPENROUTER_API_KEY` to autolabel keypoints from the first frame with OpenRouter, then propagate them through the video with the selected point tracker
 - Keypoint autolabeling sends `robocup_labeling_app/keypoints.txt` directly as the OpenRouter prompt, can be pointed elsewhere with `ROBOCUP_KEYPOINTS_FILE`, and uses `google/gemini-3.6-flash` unless `ROBOCUP_KEYPOINT_MODEL` is set
 - CoTracker keypoint propagation passes a full-image query grid together with the VLM keypoints; tune the grid spacing with `ROBOCUP_KEYPOINT_GRID_STEP` (default `32`). TAPIR, BootsTAPIR, and Track-On skip the full-image grid and track only local samples around each VLM keypoint to avoid excessive memory use
@@ -85,7 +95,7 @@ The autosave is overwritten as you work; use `Export` for a finished copy.
 ## Optional TAPIR / BootsTAPIR Setup
 
 ```bash
-cd ~/robocup/robocuplabeling
+cd sam2-coco-labeler   # the repository root
 git clone https://github.com/google-deepmind/tapnet.git
 cd tapnet
 python3 -m pip install -r requirements_inference.txt
@@ -101,7 +111,9 @@ For GPU inference, install a JAX build that matches the machine's CUDA and cuDNN
 ## Optional Track-On Setup
 
 ```bash
-cd ~/robocup/robocuplabeling/track_on
+cd sam2-coco-labeler   # the repository root
+git clone https://github.com/gorkaydemir/track_on.git
+cd track_on
 mamba create -n track_on_r python=3.12
 mamba activate track_on_r
 mamba install pytorch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 pytorch-cuda=12.1 -c pytorch -c nvidia

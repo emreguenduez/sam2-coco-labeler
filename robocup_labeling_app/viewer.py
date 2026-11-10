@@ -2141,7 +2141,7 @@ class Sam2VideoPropagationEngine:
         if self.cotracker_predictor is not None:
             return
 
-        local_cotracker_root = self.workspace_root / "robocuplabeling/co-tracker"
+        local_cotracker_root = Path(__file__).resolve().parent.parent / "co-tracker"
         if local_cotracker_root.exists() and str(local_cotracker_root) not in sys.path:
             sys.path.insert(0, str(local_cotracker_root))
 
@@ -2187,7 +2187,7 @@ class Sam2VideoPropagationEngine:
                 return ckpt_path
 
         candidates = [
-            self.workspace_root / "robocuplabeling/co-tracker/checkpoints/scaled_offline.pth",
+            Path(__file__).resolve().parent.parent / "co-tracker/checkpoints/scaled_offline.pth",
             self.workspace_root / "cotracker/checkpoints/scaled_offline.pth",
             self.package_root / "checkpoints/scaled_offline.pth",
         ]
@@ -2210,7 +2210,7 @@ class Sam2VideoPropagationEngine:
                 return root_path
 
         candidates = [
-            self.workspace_root / "robocuplabeling/tapnet",
+            Path(__file__).resolve().parent.parent / "tapnet",
             self.workspace_root / "tapnet",
         ]
         for path in candidates:
@@ -2226,7 +2226,7 @@ class Sam2VideoPropagationEngine:
                 return root_path
 
         candidates = [
-            self.workspace_root / "robocuplabeling/track_on",
+            Path(__file__).resolve().parent.parent / "track_on",
             self.workspace_root / "track_on",
         ]
         for path in candidates:
