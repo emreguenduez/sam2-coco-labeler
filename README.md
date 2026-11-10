@@ -1,24 +1,28 @@
 # RoboCup Labeling
 
-This folder now contains a lightweight desktop image-labeling starter app with
-an interface inspired by X-AnyLabeling.
+A lightweight desktop app for labeling RoboCup images with SAM2-assisted object
+masks and keypoints, exported as COCO. The interface is inspired by X-AnyLabeling.
 
 ## Features
 
 - Classic top menu bar with `File`, `Tools`, `Export`, `View`, and `Help`
-- Open an image folder with `Ctrl+U`
+- Open an image folder with `Ctrl+U`, including iPhone HEIC photos; large photos are downscaled on import (see [Importing photos](#importing-photos))
 - Automatically show the first image in the selected folder
 - Navigate between images with the left and right arrow keys
+- Zoom with the scroll wheel or a trackpad pinch, pan with a right-drag (or a left-drag with the Browse tool), and press `0` or use `View > Fit To Window` to fit the image again
 - Point tool for placing keypoints directly on the image
 - Unique point ids per image, with optional id visualization on the canvas
 - SAM2 prompt mode with point and box prompts for a single object
 - Immediate grey mask preview from SAM2 while prompts are being added
 - Finish the current SAM2 preview as a labeled object with its own object id
+- Label prompts autocomplete from the labels already used in the open folder (case-insensitive, matching any part of the label)
+- Rename an object by double-clicking it in the Objects list; the new label applies to that object in every image
 - Incoming-scene autolabeling for objects or keypoints
 - One-off autolabeling for a folder containing RGB video frames
 - COCO import and export for finished object masks and point annotations
 - Undo and redo support for annotation edits, imports, deletions, and task creation
-- X-AnyLabeling-style layout with a left tool rail, centered canvas, and right sidebar
+- Annotations are autosaved and restored when the folder is reopened (see [Autosave](#autosave))
+- X-AnyLabeling-style layout with a left tool rail, centered canvas, and right sidebar; the sidebar and tool rail scroll when the window is too short to fit them
 
 ## Run
 
@@ -36,12 +40,33 @@ python3 run_app.py
 
 - SAM2 runs on the Apple GPU (MPS) automatically and falls back to the CPU if an op is unsupported; force a device with `ROBOCUP_DEVICE=cpu|mps|cuda`.
 - The image embedding is cached per image, so only the first SAM2 prompt on an image is slow.
-- Phone photos: run `.venv/bin/python prepare_images.py RAW_DIR DATASET_DIR --tag <place_camera>` first. It converts HEIC to JPEG, bakes in the EXIF rotation and downsizes to 2048 px.
+- Phone photos can be opened directly (see [Importing photos](#importing-photos)). To build a renamed dataset folder instead, run `.venv/bin/python prepare_images.py RAW_DIR DATASET_DIR --tag <place_camera>`, which converts HEIC to JPEG, bakes in the EXIF rotation and downsizes to 2048 px.
 - Check an export with `.venv/bin/python visualize_coco.py DATASET_DIR/annotations_coco_objects.json`, which writes overlay images to `DATASET_DIR/visualized/`.
+
+## Importing photos
+
+When a folder contains HEIC photos or images larger than 2048 px, opening it
+writes 2048 px JPEG copies (with the EXIF rotation applied) into a
+`labeling_2048/` subfolder and labels those. The originals are not changed.
+Reopening the folder converts only photos that were added or changed since, so
+new photos can simply be dropped into the folder. Full-resolution phone photos
+cost about 25 MB of memory per mask, so downscaling keeps SAM2 and the app fast.
+
+- Change the size with `ROBOCUP_MAX_SIDE=1536 ./start_app.sh`, or turn downscaling off with `ROBOCUP_MAX_SIDE=0`
+- Results from incoming-scene autolabeling are loaded at full resolution, since their coordinates refer to the original frames
+
+## Autosave
+
+Every 30 seconds after a change, and when switching folders or quitting, the app
+writes `annotations_autosave.json` (COCO format) into the folder being labeled,
+e.g. `labeling_2048/annotations_autosave.json`. Reopening the folder restores it
+automatically, so a crash loses at most the last 30 seconds. Quit with `Cmd+Q`
+or by closing the window, rather than force-quitting, so the final save runs.
+The autosave is overwritten as you work; use `Export` for a finished copy.
 
 ## Notes
 
-- Supported image formats: `.jpg`, `.jpeg`, `.png`, `.bmp`, `.gif`, `.tif`, `.tiff`, `.webp`
+- Supported image formats: `.jpg`, `.jpeg`, `.png`, `.bmp`, `.gif`, `.tif`, `.tiff`, `.webp`, `.heic`, `.heif` (HEIC needs `pillow-heif`, which `setup_mac.sh` installs)
 - SAM2 mode expects the local `SAM2-Plus` bundle and a compatible SAM2 checkpoint already available in the workspace
 - Set `AUTOLABELING_MODE=keypoints` and `OPENROUTER_API_KEY` to autolabel keypoints from the first frame with OpenRouter, then propagate them through the video with the selected point tracker
 - Keypoint autolabeling sends `robocup_labeling_app/keypoints.txt` directly as the OpenRouter prompt, can be pointed elsewhere with `ROBOCUP_KEYPOINTS_FILE`, and uses `google/gemini-3.6-flash` unless `ROBOCUP_KEYPOINT_MODEL` is set
@@ -55,7 +80,7 @@ python3 run_app.py
 - Track-On uses the official `track_on` implementation when installed; set `ROBOCUP_TRACKON_ROOT` to the local checkout, `ROBOCUP_TRACKON_CHECKPOINT` to a Track-On checkpoint, optionally set `ROBOCUP_TRACKON_CONFIG`, tune `ROBOCUP_TRACKON_SUPPORT_GRID_SIZE` (default `0`), and set `ROBOCUP_TRACKON_PYTHON` to run Track-On in a separate environment while keeping the app in its usual environment
 - Use `Tools > Autolabel Frame Folder` to select a folder containing the RGB frames for one video and process it as a background task
 - COCO export writes object masks as RLE segmentations and points as point-style annotations in the same JSON file
-- Useful shortcuts: `Ctrl+U` opens an image folder, left/right arrows change frame, `F` finishes the current SAM2 mask, `B` clears SAM2 prompts, and `Ctrl+A` selects all frames when the timeline panel is focused
+- Useful shortcuts: `Ctrl+U` opens an image folder, left/right arrows change frame, `F` finishes the current SAM2 mask, `B` clears SAM2 prompts, `0` fits the image to the window, and `Ctrl+A` selects all frames when the timeline panel is focused
 
 ## Optional TAPIR / BootsTAPIR Setup
 
@@ -92,3 +117,7 @@ export ROBOCUP_TRACKON_PYTHON="$(which python)"
 Track-On checkpoints do not include the DINOv3 backbone weights. Request access to `facebook/dinov3-vits16plus-pretrain-lvd1689m` on Hugging Face and run `huggingface-cli login` in the environment before first inference.
 
 After setting these variables, switch back to the usual app environment before launching the labeling app. The app will spawn `ROBOCUP_TRACKON_PYTHON` only for Track-On inference.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
