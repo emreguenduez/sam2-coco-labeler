@@ -1,0 +1,4 @@
+Extract the following keypoint from the image:
+- right leg
+- nose
+- eye

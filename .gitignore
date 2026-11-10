@@ -1,0 +1,20 @@
+# Local environment and caches
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Third-party model code and weights (see README for where to get them)
+SAM2-Plus/
+co-tracker/
+tapnet/
+track_on/
+checkpoints/
+*.pt
+*.pth
+*.npy
+
+# Photos and labeling output
+dataset/
+labeling_*/
+annotations_autosave.json

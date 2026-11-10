@@ -1,0 +1,13 @@
+Extract the following keypoints from the tshirt in the image:
+- left hem
+- right hem
+- left armpit
+- right armpit
+- left sleeve bottom
+- right sleeve bottom
+- left sleeve top
+- right sleeve top
+- left shoulder
+- right shoulder
+- left neck
+- right neck

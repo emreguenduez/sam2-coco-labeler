@@ -3,10 +3,13 @@ from __future__ import annotations
 import copy
 import json
 import base64
+import math
 import mimetypes
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import threading
 import urllib.error
 import urllib.request
@@ -16,8 +19,15 @@ from pathlib import Path
 from queue import Empty, Queue
 
 import numpy as np
-from PIL import Image, ImageDraw
-from PyQt6.QtCore import QLineF, QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PIL import Image, ImageDraw, ImageOps
+
+try:  # iPhone photos are often HEIC, sometimes even with a .jpeg extension.
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except ImportError:
+    pass
+from PyQt6.QtCore import QEvent, QLineF, QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QActionGroup,
@@ -32,6 +42,7 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QCompleter,
     QComboBox,
     QDockWidget,
     QFileDialog,
@@ -39,12 +50,14 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QProgressBar,
+    QProgressDialog,
     QScrollArea,
     QSizePolicy,
     QStatusBar,
@@ -53,6 +66,10 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+
+# Photos with a longer side than this are labeled from downscaled JPEG copies (0 disables).
+MAX_LABELING_SIDE = int(os.environ.get("ROBOCUP_MAX_SIDE", "2048"))
+AUTOSAVE_FILE_NAME = "annotations_autosave.json"
 
 IMAGE_EXTENSIONS = {
     ".jpg",
@@ -63,6 +80,8 @@ IMAGE_EXTENSIONS = {
     ".tif",
     ".tiff",
     ".webp",
+    ".heic",
+    ".heif",
 }
 
 OBJECT_COLORS = [
@@ -338,8 +357,43 @@ class AppStateSnapshot:
     selected_timeline_points: set[str]
 
 
+def _copy_sharing_arrays(value):
+    # Masks are never edited in place, so undo snapshots share the arrays
+    # instead of copying ~25 MB per full-resolution mask on every edit.
+    memo: dict[int, object] = {}
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, np.ndarray):
+            memo[id(item)] = item
+        elif isinstance(item, dict):
+            stack.extend(item.values())
+        elif isinstance(item, (list, tuple, set)):
+            stack.extend(item)
+        elif hasattr(item, "__dataclass_fields__"):
+            stack.extend(vars(item).values())
+    return copy.deepcopy(value, memo)
+
+
 def _point_tracker_display_name(point_tracker: str) -> str:
-    return "CoTracker" if point_tracker == "cotracker" else "SAM2"
+    display_names = {
+        "sam2": "SAM-PT/SAM2",
+        "sampt": "SAM-PT",
+        "cotracker": "CoTracker",
+        "tapir": "TAPIR",
+        "bootstapir": "BootsTAPIR",
+        "trackon": "Track-On",
+    }
+    return display_names.get(point_tracker, point_tracker)
+
+
+def _current_keypoint_tracker_backend() -> str:
+    requested_backend = os.environ.get("ROBOCUP_KEYPOINT_TRACKER", "sampt").strip().lower()
+    if requested_backend in {"sampt", "sam-pt", "sam_pt", "sam2"}:
+        return "sam2"
+    if requested_backend in {"tapir", "bootstapir", "cotracker", "trackon"}:
+        return requested_backend
+    return "sam2"
 
 
 class OpenVocabularyDetectorInterface:
@@ -661,6 +715,75 @@ def _sample_grid_points_from_mask(
     return [(float(np.mean(x_indices)), float(np.mean(y_indices)))]
 
 
+def _sample_grid_points_for_image(
+    *,
+    image_width: int,
+    image_height: int,
+    step: int,
+) -> list[tuple[float, float]]:
+    if image_width <= 0 or image_height <= 0:
+        return []
+
+    grid_step = max(1, int(step))
+    sampled_points: list[tuple[float, float]] = []
+    y_start = min(image_height - 1, grid_step // 2)
+    x_start = min(image_width - 1, grid_step // 2)
+    for y in range(y_start, image_height, grid_step):
+        for x in range(x_start, image_width, grid_step):
+            sampled_points.append((float(x), float(y)))
+
+    if sampled_points:
+        return sampled_points
+
+    return [(float(image_width - 1) / 2.0, float(image_height - 1) / 2.0)]
+
+
+def _sample_points_around_keypoint(
+    *,
+    x: float,
+    y: float,
+    image_width: int,
+    image_height: int,
+    radius: float,
+    sample_count: int,
+    include_center: bool,
+) -> list[tuple[float, float]]:
+    if image_width <= 0 or image_height <= 0:
+        return []
+
+    def clamp_point(x_value: float, y_value: float) -> tuple[float, float]:
+        return (
+            max(0.0, min(float(image_width - 1), x_value)),
+            max(0.0, min(float(image_height - 1), y_value)),
+        )
+
+    sampled_points: list[tuple[float, float]] = []
+    seen_points: set[tuple[int, int]] = set()
+
+    def add_sample(x_value: float, y_value: float) -> None:
+        clamped_x, clamped_y = clamp_point(x_value, y_value)
+        rounded_key = (int(round(clamped_x)), int(round(clamped_y)))
+        if rounded_key in seen_points:
+            return
+        seen_points.add(rounded_key)
+        sampled_points.append((clamped_x, clamped_y))
+
+    if include_center:
+        add_sample(x, y)
+
+    if radius > 0.0 and sample_count > 0:
+        for sample_index in range(sample_count):
+            angle = (2.0 * math.pi * sample_index) / sample_count
+            add_sample(
+                x + math.cos(angle) * radius,
+                y + math.sin(angle) * radius,
+            )
+
+    if not sampled_points:
+        add_sample(x, y)
+    return sampled_points
+
+
 def _mean_keypoint_prompt(points: list[KeypointAnnotation]) -> SamPromptPoint | None:
     if not points:
         return None
@@ -685,18 +808,17 @@ def _image_export_name_static(image_path: Path, folder_path: Path | None) -> str
 
 
 def _encode_mask_to_rle_static(mask: np.ndarray) -> dict[str, object]:
-    flat_mask = mask.astype(np.uint8).flatten(order="F")
-    counts: list[int] = []
-    current_value = 0
-    run_length = 0
-    for value in flat_mask:
-        if int(value) == current_value:
-            run_length += 1
-            continue
-        counts.append(run_length)
-        run_length = 1
-        current_value = int(value)
-    counts.append(run_length)
+    # Uncompressed COCO RLE (column-major, starts with a run of zeros).
+    # Vectorised: a per-pixel Python loop takes seconds on 12 MP photos.
+    flat_mask = np.asarray(mask).astype(bool).flatten(order="F")
+    if flat_mask.size == 0:
+        counts: list[int] = [0]
+    else:
+        change_points = np.flatnonzero(flat_mask[1:] != flat_mask[:-1]) + 1
+        boundaries = np.concatenate(([0], change_points, [flat_mask.size]))
+        counts = np.diff(boundaries).astype(int).tolist()
+        if flat_mask[0]:
+            counts.insert(0, 0)
     return {
         "size": [int(mask.shape[0]), int(mask.shape[1])],
         "counts": counts,
@@ -819,8 +941,16 @@ def _build_vlmgist_settings_for_request(
      return VLMGIST_SETTINGS
 
 
+OPENROUTER_GEMINI_3_6_FLASH_MODEL = "google/gemini-3.6-flash"
+
+
 def _current_autolabeling_mode() -> str:
-    return "tshirt" if os.environ.get("AUTOLABELING_MODE", "").strip().lower() == "tshirt" else "objects"
+    requested_mode = os.environ.get("AUTOLABELING_MODE", "").strip().lower()
+    if requested_mode in {"keypoint", "keypoints", "points"}:
+        return "keypoints"
+    if requested_mode == "tshirt":
+        return "tshirt"
+    return "objects"
 
 
 TSHIRT_KEYPOINT_ID_BY_LABEL: dict[str, int] = {
@@ -860,16 +990,25 @@ def _select_tshirt_seed_frame_indices(frame_count: int) -> list[int]:
 
 
 class OpenRouterKeypointExtractor:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        model: str | None = None,
+        prompt: str | None = None,
+        point_order: str | None = None,
+        model_env_var: str = "ROBOCUP_TSHIRT_KEYPOINT_MODEL",
+        prompt_env_var: str = "ROBOCUP_TSHIRT_KEYPOINT_PROMPT",
+        point_order_env_var: str = "ROBOCUP_TSHIRT_KEYPOINT_ORDER",
+        default_model: str = "google/gemini-2.5-flash",
+        default_prompt: str | None = None,
+    ) -> None:
         self.api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-        self.model = os.environ.get("ROBOCUP_TSHIRT_KEYPOINT_MODEL", "google/gemini-2.5-flash")
         tshirt_keypoint_lines = [
             f"{point_id}: {label}"
             for label, point_id in TSHIRT_KEYPOINT_ID_BY_LABEL.items()
         ]
-        self.prompt = os.environ.get(
-            "ROBOCUP_TSHIRT_KEYPOINT_PROMPT",
-            (
+        if default_prompt is None:
+            default_prompt = (
                 "Return a JSON array containing all requested tshirt keypoints visible in the image. "
                 "Only use the following exact tshirt keypoints and labels:\n"
                 f"{chr(10).join(tshirt_keypoint_lines)}\n"
@@ -879,9 +1018,14 @@ class OpenRouterKeypointExtractor:
                 "The 'label' must exactly match one of the labels above. "
                 "The field 'point_2d' must be the keypoint location as normalized [y, x] coordinates from 0 to 1000. "
                 "Do not invent additional labels, do not rename labels, and do not include invisible keypoints."
-            ),
-        )
-        self.point_order = os.environ.get("ROBOCUP_TSHIRT_KEYPOINT_ORDER", "yx").strip().lower()
+            )
+        self.model = (
+            model or os.environ.get(model_env_var, default_model)
+        ).strip() or default_model
+        self.prompt = prompt or os.environ.get(prompt_env_var, "").strip() or default_prompt
+        self.point_order = (
+            point_order or os.environ.get(point_order_env_var, "yx")
+        ).strip().lower()
 
     def extract_keypoints(self, image_path: Path) -> OpenRouterKeypointResult:
         if not self.api_key:
@@ -1014,6 +1158,24 @@ class OpenRouterKeypointExtractor:
         if 0.0 <= x_raw <= 1000.0 and 0.0 <= y_raw <= 1000.0:
             return x_raw / 1000.0 * width, y_raw / 1000.0 * height
         return x_raw, y_raw
+
+
+def _read_keypoint_prompt(keypoints_file: Path) -> str:
+    try:
+        prompt = keypoints_file.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(f"Could not read keypoint prompt file {keypoints_file}") from exc
+
+    if not prompt:
+        raise RuntimeError(f"Keypoint prompt file {keypoints_file} is empty.")
+    return prompt
+
+
+def _keypoints_file_path() -> Path:
+    env_path = os.environ.get("ROBOCUP_KEYPOINTS_FILE", "").strip()
+    if env_path:
+        return Path(env_path).expanduser()
+    return Path(__file__).resolve().parent / "keypoints.txt"
 
 
 def _run_scene_processing_pipeline(
@@ -1166,6 +1328,226 @@ def _run_scene_processing_pipeline(
     seeded_count = len(seeded_objects)
     return (
         f"{detection_result.message} | seeded {seeded_count} object(s) | {propagation_status}",
+        output_path,
+    )
+
+
+def _run_keypoint_scene_processing_pipeline(
+    task: SceneBackgroundTask,
+    *,
+    workspace_root: Path,
+    package_root: Path,
+    progress_callback,
+) -> tuple[str, Path]:
+    image_paths = sorted(
+        path
+        for path in task.request.image_dir.iterdir()
+        if path.suffix.lower() in IMAGE_EXTENSIONS
+    )
+    if not image_paths:
+        raise RuntimeError("The scene folder does not contain supported image files.")
+
+    first_image_path = image_paths[0]
+    progress_callback(5, "Initializing OpenRouter keypoint extractor")
+    keypoints_file = _keypoints_file_path()
+    keypoint_prompt = _read_keypoint_prompt(keypoints_file)
+    prompt_source = str(keypoints_file)
+    extractor = OpenRouterKeypointExtractor(
+        model_env_var="ROBOCUP_KEYPOINT_MODEL",
+        point_order_env_var="ROBOCUP_KEYPOINT_ORDER",
+        default_model=OPENROUTER_GEMINI_3_6_FLASH_MODEL,
+        prompt=keypoint_prompt,
+    )
+
+    progress_callback(15, "Extracting keypoints from first frame")
+    extraction_result = extractor.extract_keypoints(first_image_path)
+
+    point_annotations: dict[str, list[KeypointAnnotation]] = {
+        str(path): [] for path in image_paths
+    }
+    seed_points = [
+        KeypointAnnotation(
+            point_id=point_index,
+            x=detection.x,
+            y=detection.y,
+        )
+        for point_index, detection in enumerate(extraction_result.keypoints, start=1)
+    ]
+    if seed_points:
+        point_annotations[str(first_image_path)] = copy.deepcopy(seed_points)
+
+    if seed_points and len(image_paths) > 1:
+        point_tracker = _current_keypoint_tracker_backend()
+        tracker_name = _point_tracker_display_name(point_tracker)
+        if point_tracker == "sam2":
+            progress_callback(30, "Running SAM-PT keypoint propagation")
+            propagation_task = PropagationTask(
+                task_id=task.task_id,
+                start_index=0,
+                end_index=len(image_paths) - 1,
+                object_keys=[],
+                point_keys=[f"Point {point.point_id}" for point in seed_points],
+                frames=[
+                    TaskFrameSelection(
+                        frame_index=frame_index,
+                        image_path=str(image_path),
+                        points=(
+                            [
+                                TaskPointSelection(
+                                    point_key=f"Point {point.point_id}",
+                                    point_id=point.point_id,
+                                    x=point.x,
+                                    y=point.y,
+                                )
+                                for point in seed_points
+                            ]
+                            if frame_index == 0
+                            else []
+                        ),
+                    )
+                    for frame_index, image_path in enumerate(image_paths)
+                ],
+                use_reverse_pass=task.use_reverse_pass,
+                point_tracker="sam2",
+            )
+            video_engine = Sam2VideoPropagationEngine(
+                workspace_root=workspace_root,
+                package_root=package_root,
+            )
+            _object_results, point_results, tracker_status = video_engine.run_task(
+                folder_path=task.request.image_dir,
+                frame_paths=image_paths,
+                task=propagation_task,
+                progress_callback=lambda current, total: progress_callback(
+                    30 + int((current / total) * 60) if total > 0 else 30,
+                    "Running SAM-PT keypoint propagation",
+                ),
+            )
+            for frame_index, image_path in enumerate(image_paths):
+                frame_points = copy.deepcopy(point_results.get(frame_index, []))
+                if frame_index == 0 and not frame_points:
+                    frame_points = copy.deepcopy(seed_points)
+                point_annotations[str(image_path)] = frame_points
+            propagation_status = f"points: SAM-PT/SAM2 point propagation | {tracker_status}"
+        else:
+            use_full_image_grid = point_tracker == "cotracker"
+            progress_callback(30, f"Preparing {tracker_name} keypoint queries")
+            with Image.open(first_image_path) as first_image:
+                image_width, image_height = first_image.width, first_image.height
+
+            grid_step: int | None = None
+            query_specs: list[tuple[int, float, float]] = []
+            if use_full_image_grid:
+                grid_step = max(1, int(os.environ.get("ROBOCUP_KEYPOINT_GRID_STEP", "32")))
+                query_specs.extend(
+                    (0, float(x_value), float(y_value))
+                    for x_value, y_value in _sample_grid_points_for_image(
+                        image_width=image_width,
+                        image_height=image_height,
+                        step=grid_step,
+                    )
+                )
+            local_radius = max(
+                0.0,
+                float(os.environ.get("ROBOCUP_KEYPOINT_LOCAL_SAMPLE_RADIUS", "6")),
+            )
+            local_sample_count = max(
+                0,
+                int(os.environ.get("ROBOCUP_KEYPOINT_LOCAL_SAMPLE_COUNT", "8")),
+            )
+            include_center = os.environ.get(
+                "ROBOCUP_KEYPOINT_LOCAL_SAMPLE_INCLUDE_CENTER",
+                "1",
+            ).strip().lower() not in {"0", "false", "no", "off"}
+            keypoint_track_assignments: list[tuple[int, list[int]]] = []
+            for point in seed_points:
+                local_query_indices: list[int] = []
+                for x_value, y_value in _sample_points_around_keypoint(
+                    x=float(point.x),
+                    y=float(point.y),
+                    image_width=image_width,
+                    image_height=image_height,
+                    radius=local_radius,
+                    sample_count=local_sample_count,
+                    include_center=include_center,
+                ):
+                    query_specs.append((0, x_value, y_value))
+                    local_query_indices.append(len(query_specs) - 1)
+                keypoint_track_assignments.append((point.point_id, local_query_indices))
+
+            progress_callback(40, f"Running {tracker_name} keypoint propagation")
+            video_engine = Sam2VideoPropagationEngine(
+                workspace_root=workspace_root,
+                package_root=package_root,
+            )
+            pred_tracks, visibility_mask = video_engine._run_point_tracker_queries(
+                frame_paths=image_paths,
+                query_specs=query_specs,
+                point_tracker=point_tracker,
+                backward_tracking=task.use_reverse_pass,
+            )
+            progress_callback(90, f"Collecting {tracker_name} keypoint tracks")
+            for frame_index, image_path in enumerate(image_paths):
+                frame_points: list[KeypointAnnotation] = []
+                for point_id, query_indices in keypoint_track_assignments:
+                    visible_tracks = [
+                        pred_tracks[frame_index, query_index]
+                        for query_index in query_indices
+                        if frame_index == 0 or bool(visibility_mask[frame_index, query_index])
+                    ]
+                    if not visible_tracks:
+                        continue
+                    xy_values = np.asarray(visible_tracks, dtype=np.float32)
+                    x_value, y_value = np.median(xy_values, axis=0)
+                    frame_points.append(
+                        KeypointAnnotation(
+                            point_id=point_id,
+                            x=float(x_value),
+                            y=float(y_value),
+                        )
+                    )
+                if frame_index == 0 and not frame_points:
+                    frame_points = copy.deepcopy(seed_points)
+                point_annotations[str(image_path)] = frame_points
+            query_layout = (
+                f"full-image grid (step {grid_step}) + local circle"
+                if use_full_image_grid
+                else "local circle only"
+            )
+            propagation_status = (
+                f"points: {query_layout} "
+                f"(r={local_radius:g}, n={local_sample_count}, "
+                f"{len(query_specs)} total {tracker_name} queries) + "
+                f"{video_engine._point_tracker_status(point_tracker)}"
+            )
+    elif seed_points:
+        propagation_status = "Only one frame available; no propagation needed"
+    else:
+        propagation_status = "No keypoints extracted to propagate"
+
+    progress_callback(94, "Saving output annotations")
+    output_path = Path(task.output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = _build_coco_payload_for_scene(
+        image_paths=image_paths,
+        folder_path=task.request.image_dir,
+        object_annotations=None,
+        point_annotations=point_annotations,
+    )
+    with open(output_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+    progress_callback(100, "Finished")
+    labels = [detection.label for detection in extraction_result.keypoints if detection.label]
+    label_summary = ""
+    if labels:
+        label_summary = f" | labels: {', '.join(labels[:8])}"
+        if len(labels) > 8:
+            label_summary += f", +{len(labels) - 8} more"
+    return (
+        f"{extraction_result.message} | model: {extractor.model} | "
+        f"prompt source: {prompt_source} | "
+        f"seeded {len(seed_points)} keypoint(s){label_summary} | {propagation_status}",
         output_path,
     )
 
@@ -1359,6 +1741,19 @@ def _run_tshirt_scene_processing_pipeline(
     )
 
 
+def _select_torch_device(torch) -> str:
+    """Pick cuda, then Apple-Silicon mps, then cpu. Override with ROBOCUP_DEVICE."""
+    requested = os.environ.get("ROBOCUP_DEVICE", "auto").strip().lower()
+    if requested in {"cuda", "mps", "cpu"}:
+        return requested
+    if torch.cuda.is_available():
+        return "cuda"
+    mps_backend = getattr(torch.backends, "mps", None)
+    if mps_backend is not None and mps_backend.is_available():
+        return "mps"
+    return "cpu"
+
+
 class Sam2ImageEngine:
     def __init__(self, workspace_root: Path, package_root: Path) -> None:
         self.workspace_root = workspace_root
@@ -1368,6 +1763,9 @@ class Sam2ImageEngine:
         self.torch = None
         self.model_name = "SAM2 not loaded"
         self.last_error: str | None = None
+        # Cache the image embedding so that adding prompts to the same image does
+        # not re-run the (expensive) image encoder on every click.
+        self._embedded_image_key: tuple[str, float] | None = None
 
     def predict(
         self,
@@ -1379,11 +1777,34 @@ class Sam2ImageEngine:
             return None, "No prompts"
 
         self._ensure_loaded()
+        try:
+            return self._predict_loaded(image_path, prompt_points, prompt_box)
+        except Exception:
+            if self.device != "mps":
+                raise
+            # Apple-GPU support in SAM2 is preliminary; fall back to the CPU.
+            self.predictor = None
+            self._embedded_image_key = None
+            self._ensure_loaded(force_device="cpu")
+            return self._predict_loaded(image_path, prompt_points, prompt_box)
 
-        image = np.array(Image.open(image_path).convert("RGB"))
+    def _predict_loaded(
+        self,
+        image_path: Path,
+        prompt_points: list[SamPromptPoint],
+        prompt_box: SamPromptBox | None,
+    ) -> tuple[np.ndarray | None, str]:
+        try:
+            image_key = (str(image_path), image_path.stat().st_mtime)
+        except OSError:
+            image_key = (str(image_path), 0.0)
         with self.torch.inference_mode():
             with self._autocast_context():
-                self.predictor.set_image(image)
+                if image_key != self._embedded_image_key:
+                    # Match the canvas, which shows images with their EXIF rotation applied.
+                    image = np.array(ImageOps.exif_transpose(Image.open(image_path)).convert("RGB"))
+                    self.predictor.set_image(image)
+                    self._embedded_image_key = image_key
 
                 point_coords = None
                 point_labels = None
@@ -1406,13 +1827,14 @@ class Sam2ImageEngine:
         score = float(scores[0]) if np.ndim(scores) else float(scores)
         return np.asarray(mask).astype(bool), f"{self.model_name} on {self.device} | score {score:.3f}"
 
-    def _ensure_loaded(self) -> None:
+    def _ensure_loaded(self, force_device: str | None = None) -> None:
         if self.predictor is not None:
             return
 
         if str(self.package_root) not in sys.path:
             sys.path.insert(0, str(self.package_root))
 
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
         import torch
         from hydra import initialize_config_module
         from hydra.core.global_hydra import GlobalHydra
@@ -1427,10 +1849,11 @@ class Sam2ImageEngine:
         initialize_config_module("sam2", version_base="1.2")
 
         config_name, checkpoint_path, model_name = self._discover_model_files()
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = force_device or _select_torch_device(torch)
         self._configure_torch_runtime(torch, device)
         model = build_sam2(config_name, str(checkpoint_path), device=device)
         self.predictor = SAM2ImagePredictor(model)
+        self._embedded_image_key = None
         self.torch = torch
         self.device = device
         self.model_name = model_name
@@ -1512,13 +1935,23 @@ class Sam2VideoPropagationEngine:
         self.mask_predictor = None
         self.point_predictor = None
         self.cotracker_predictor = None
+        self.tapir_predictors: dict[str, object] = {}
+        self.tapir_jax = None
+        self.tapir_model_utils = None
+        self.trackon_predictor = None
         self.torch = None
         self.device = None
         self.model_name = "SAM2-Plus not loaded"
         self.cotracker_model_name = "CoTracker not loaded"
         self.cotracker_device = None
+        self.tapir_model_names: dict[str, str] = {}
+        self.tapir_device = "JAX"
+        self.trackon_model_name = "Track-On not loaded"
+        self.trackon_device = None
         self.last_error: str | None = None
         self.cotracker_last_error: str | None = None
+        self.tapir_last_error: str | None = None
+        self.trackon_last_error: str | None = None
         self.score_thresh = 0.0
         self.point_radius = 50
         self.point_sigma = 16
@@ -1539,7 +1972,11 @@ class Sam2VideoPropagationEngine:
         point_results: dict[int, list[KeypointAnnotation]] = {}
         object_stage_count = int(bool(task.object_keys)) * (2 if task.use_reverse_pass else 1)
         if task.point_keys:
-            point_stage_count = 1 if task.point_tracker == "cotracker" else (2 if task.use_reverse_pass else 1)
+            point_stage_count = (
+                1
+                if task.point_tracker in {"cotracker", "tapir", "bootstapir", "trackon"}
+                else (2 if task.use_reverse_pass else 1)
+            )
         else:
             point_stage_count = 0
         stage_count = object_stage_count + point_stage_count
@@ -1581,10 +2018,11 @@ class Sam2VideoPropagationEngine:
             )
             status_parts.append(f"objects: {self.model_name} on {self.device}")
         if task.point_keys:
-            if task.point_tracker == "cotracker":
+            if task.point_tracker in {"cotracker", "tapir", "bootstapir", "trackon"}:
                 forward_point_results, completed_steps = self._run_cotracker_point_propagation(
                     frame_paths=frame_paths,
                     ordered_frames=ordered_frames,
+                    point_tracker=task.point_tracker,
                     backward_tracking=task.use_reverse_pass,
                     completed_steps=completed_steps,
                     total_steps=total_steps,
@@ -1592,7 +2030,7 @@ class Sam2VideoPropagationEngine:
                 )
                 point_results = forward_point_results
                 status_parts.append(
-                    f"points: {self.cotracker_model_name} on {self.cotracker_device}"
+                    f"points: {self._point_tracker_status(task.point_tracker)}"
                 )
             else:
                 self._ensure_loaded()
@@ -1703,6 +2141,10 @@ class Sam2VideoPropagationEngine:
         if self.cotracker_predictor is not None:
             return
 
+        local_cotracker_root = self.workspace_root / "robocuplabeling/co-tracker"
+        if local_cotracker_root.exists() and str(local_cotracker_root) not in sys.path:
+            sys.path.insert(0, str(local_cotracker_root))
+
         try:
             import torch
             from cotracker.predictor import CoTrackerPredictor
@@ -1715,13 +2157,23 @@ class Sam2VideoPropagationEngine:
         checkpoint_path = self._discover_cotracker_checkpoint()
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self._configure_torch_runtime(torch, device)
-        predictor = CoTrackerPredictor(checkpoint=str(checkpoint_path))
+        window_len = max(1, int(os.environ.get("ROBOCUP_COTRACKER_WINDOW_LEN", "60")))
+        visibility_threshold = float(
+            os.environ.get("ROBOCUP_COTRACKER_VISIBILITY_THRESHOLD", "0.5")
+        )
+        predictor = CoTrackerPredictor(
+            checkpoint=str(checkpoint_path),
+            window_len=window_len,
+            visibility_threshold=visibility_threshold,
+        )
         if device == "cuda":
             predictor = predictor.cuda()
         predictor.eval()
 
         self.cotracker_predictor = predictor
-        self.cotracker_model_name = checkpoint_path.name
+        self.cotracker_model_name = (
+            f"{checkpoint_path.name}, window={window_len}, vis={visibility_threshold:g}"
+        )
         self.cotracker_device = device
         self.cotracker_last_error = None
         if self.torch is None:
@@ -1746,6 +2198,546 @@ class Sam2VideoPropagationEngine:
         raise RuntimeError(
             "No CoTracker checkpoint was found. Set ROBOCUP_COTRACKER_CHECKPOINT or place scaled_offline.pth in a checkpoints directory."
         )
+
+    def _tapir_model_type(self, point_tracker: str) -> str:
+        return "bootstapir" if point_tracker == "bootstapir" else "tapir"
+
+    def _discover_tapnet_root(self) -> Path | None:
+        env_root = os.environ.get("ROBOCUP_TAPNET_ROOT", "").strip()
+        if env_root:
+            root_path = Path(env_root).expanduser()
+            if root_path.exists():
+                return root_path
+
+        candidates = [
+            self.workspace_root / "robocuplabeling/tapnet",
+            self.workspace_root / "tapnet",
+        ]
+        for path in candidates:
+            if path.exists():
+                return path
+        return None
+
+    def _discover_trackon_root(self) -> Path | None:
+        env_root = os.environ.get("ROBOCUP_TRACKON_ROOT", "").strip()
+        if env_root:
+            root_path = Path(env_root).expanduser()
+            if root_path.exists():
+                return root_path
+
+        candidates = [
+            self.workspace_root / "robocuplabeling/track_on",
+            self.workspace_root / "track_on",
+        ]
+        for path in candidates:
+            if path.exists():
+                return path
+        return None
+
+    def _discover_trackon_checkpoint(self) -> Path:
+        env_ckpt = os.environ.get("ROBOCUP_TRACKON_CHECKPOINT", "").strip()
+        if env_ckpt:
+            ckpt_path = Path(env_ckpt).expanduser()
+            if ckpt_path.exists():
+                return ckpt_path
+
+        trackon_root = self._discover_trackon_root()
+        checkpoint_names = [
+            "track_on_r.pt",
+            "trackon2_dinov3_checkpoint.pt",
+            "trackon2_checkpoint.pth",
+            "trackon_checkpoint.pth",
+        ]
+        candidates: list[Path] = []
+        if trackon_root is not None:
+            for checkpoint_name in checkpoint_names:
+                candidates.extend(
+                    [
+                        trackon_root / "checkpoints" / checkpoint_name,
+                        trackon_root / checkpoint_name,
+                    ]
+                )
+
+        for path in candidates:
+            if path.exists():
+                return path
+
+        raise RuntimeError(
+            "No Track-On checkpoint was found. Set ROBOCUP_TRACKON_CHECKPOINT "
+            "or place track_on_r.pt / trackon2_dinov3_checkpoint.pt in track_on/checkpoints."
+        )
+
+    def _discover_trackon_config(self) -> Path | None:
+        env_config = os.environ.get("ROBOCUP_TRACKON_CONFIG", "").strip()
+        if env_config:
+            config_path = Path(env_config).expanduser()
+            if config_path.exists():
+                return config_path
+
+        trackon_root = self._discover_trackon_root()
+        if trackon_root is None:
+            return None
+        config_path = trackon_root / "config/test.yaml"
+        return config_path if config_path.exists() else None
+
+    def _discover_trackon_python(self) -> Path | None:
+        env_python = os.environ.get("ROBOCUP_TRACKON_PYTHON", "").strip()
+        if env_python:
+            return Path(env_python).expanduser()
+
+        home = Path.home()
+        candidates = [
+            home / "miniconda3/envs/track_on_r/bin/python",
+            home / "miniforge3/envs/track_on_r/bin/python",
+            home / "mambaforge/envs/track_on_r/bin/python",
+            home / "anaconda3/envs/track_on_r/bin/python",
+        ]
+        for path in candidates:
+            if path.exists():
+                return path
+        return None
+
+    def _ensure_trackon_loaded(self) -> None:
+        if self.trackon_predictor is not None:
+            return
+
+        trackon_root = self._discover_trackon_root()
+        if trackon_root is not None and str(trackon_root) not in sys.path:
+            sys.path.insert(0, str(trackon_root))
+
+        try:
+            import torch
+            from model.trackon_predictor import Predictor
+            from utils.train_utils import load_args_from_yaml
+        except Exception as exc:  # noqa: BLE001
+            self.trackon_last_error = str(exc)
+            raise RuntimeError(
+                "Could not import Track-On. Install the Track-On runtime dependencies "
+                "and set ROBOCUP_TRACKON_ROOT to the local track_on checkout. "
+                f"Import error: {exc}"
+            ) from exc
+
+        checkpoint_path = self._discover_trackon_checkpoint()
+        config_path = self._discover_trackon_config()
+        model_args = load_args_from_yaml(str(config_path)) if config_path is not None else None
+        support_grid_size = max(
+            0,
+            int(os.environ.get("ROBOCUP_TRACKON_SUPPORT_GRID_SIZE", "0")),
+        )
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._configure_torch_runtime(torch, device)
+        try:
+            predictor = Predictor(
+                model_args,
+                checkpoint_path=str(checkpoint_path),
+                support_grid_size=support_grid_size,
+            ).to(device).eval()
+        except Exception as exc:  # noqa: BLE001
+            self.trackon_last_error = str(exc)
+            raise RuntimeError(
+                "Could not initialize Track-On. Check the checkpoint path, config, "
+                "Track-On dependencies, and DINOv3 Hugging Face access. "
+                f"Initialization error: {exc}"
+            ) from exc
+
+        self.trackon_predictor = predictor
+        self.trackon_model_name = (
+            f"{checkpoint_path.name}, support_grid={support_grid_size}"
+        )
+        self.trackon_device = device
+        self.trackon_last_error = None
+        if self.torch is None:
+            self.torch = torch
+
+    def _discover_tapir_checkpoint(self, model_type: str) -> Path:
+        env_name = (
+            "ROBOCUP_BOOTSTAPIR_CHECKPOINT"
+            if model_type == "bootstapir"
+            else "ROBOCUP_TAPIR_CHECKPOINT"
+        )
+        env_ckpt = os.environ.get(env_name, "").strip()
+        if env_ckpt:
+            ckpt_path = Path(env_ckpt).expanduser()
+            if ckpt_path.exists():
+                return ckpt_path
+
+        tapnet_root = self._discover_tapnet_root()
+        checkpoint_names = (
+            ["bootstapir_checkpoint_v2.npy"]
+            if model_type == "bootstapir"
+            else ["tapir_checkpoint_panning.npy"]
+        )
+        candidates: list[Path] = []
+        if tapnet_root is not None:
+            for checkpoint_name in checkpoint_names:
+                candidates.extend(
+                    [
+                        tapnet_root / "checkpoints" / checkpoint_name,
+                        tapnet_root / "checkpoint" / checkpoint_name,
+                    ]
+                )
+            candidates.append(tapnet_root / "checkpoint" / "checkpoint.npy")
+
+        for path in candidates:
+            if path.exists():
+                return path
+
+        if model_type == "bootstapir":
+            hint = (
+                "Set ROBOCUP_BOOTSTAPIR_CHECKPOINT or download "
+                "bootstapir_checkpoint_v2.npy into tapnet/checkpoints."
+            )
+        else:
+            hint = (
+                "Set ROBOCUP_TAPIR_CHECKPOINT or download "
+                "tapir_checkpoint_panning.npy into tapnet/checkpoints."
+            )
+        raise RuntimeError(f"No {model_type} checkpoint was found. {hint}")
+
+    def _ensure_tapir_loaded(self, model_type: str) -> None:
+        model_type = self._tapir_model_type(model_type)
+        if model_type in self.tapir_predictors:
+            return
+
+        tapnet_root = self._discover_tapnet_root()
+        if tapnet_root is not None and str(tapnet_root) not in sys.path:
+            sys.path.insert(0, str(tapnet_root))
+
+        try:
+            import jax
+            from tapnet.models import tapir_model
+            from tapnet.utils import model_utils
+        except Exception as exc:  # noqa: BLE001
+            self.tapir_last_error = str(exc)
+            raise RuntimeError(
+                "Could not import TapNet/TAPIR. Install the official tapnet package "
+                "and its JAX dependencies, or set ROBOCUP_TAPNET_ROOT to a local checkout. "
+                f"Import error: {exc}"
+            ) from exc
+
+        checkpoint_path = self._discover_tapir_checkpoint(model_type)
+        checkpoint_state = np.load(checkpoint_path, allow_pickle=True).item()
+        params = checkpoint_state["params"]
+        state = checkpoint_state["state"]
+
+        tapir_kwargs = {
+            "bilinear_interp_with_depthwise_conv": False,
+            "pyramid_level": 0,
+        }
+        if model_type == "bootstapir":
+            tapir_kwargs.update(
+                {
+                    "pyramid_level": 1,
+                    "extra_convs": True,
+                    "softmax_temperature": 10.0,
+                }
+            )
+
+        self.tapir_predictors[model_type] = tapir_model.ParameterizedTAPIR(
+            params,
+            state,
+            tapir_kwargs=tapir_kwargs,
+        )
+        self.tapir_jax = jax
+        self.tapir_model_utils = model_utils
+        try:
+            self.tapir_device = str(jax.devices()[0])
+        except Exception:
+            self.tapir_device = "JAX"
+        self.tapir_model_names[model_type] = checkpoint_path.name
+        self.tapir_last_error = None
+
+    def _run_point_tracker_queries(
+        self,
+        frame_paths: list[Path],
+        query_specs: list[tuple[int, float, float]],
+        *,
+        point_tracker: str,
+        backward_tracking: bool,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if point_tracker == "cotracker":
+            return self._run_cotracker_queries(
+                frame_paths=frame_paths,
+                query_specs=query_specs,
+                backward_tracking=backward_tracking,
+            )
+        if point_tracker in {"tapir", "bootstapir"}:
+            return self._run_tapir_queries(
+                frame_paths=frame_paths,
+                query_specs=query_specs,
+                model_type=point_tracker,
+            )
+        if point_tracker == "trackon":
+            return self._run_trackon_queries(
+                frame_paths=frame_paths,
+                query_specs=query_specs,
+            )
+        raise RuntimeError(f"Unsupported point tracker backend: {point_tracker}")
+
+    def _point_tracker_status(self, point_tracker: str) -> str:
+        if point_tracker == "cotracker":
+            return f"{self.cotracker_model_name} on {self.cotracker_device}"
+        if point_tracker == "trackon":
+            return f"{self.trackon_model_name} on {self.trackon_device}"
+        model_type = self._tapir_model_type(point_tracker)
+        model_name = self.tapir_model_names.get(model_type, f"{model_type} not loaded")
+        return f"{model_name} on {self.tapir_device}"
+
+    def _run_trackon_subprocess_queries(
+        self,
+        frame_paths: list[Path],
+        query_specs: list[tuple[int, float, float]],
+        *,
+        python_path: Path,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if not python_path.exists():
+            raise RuntimeError(f"ROBOCUP_TRACKON_PYTHON does not exist: {python_path}")
+
+        trackon_root = self._discover_trackon_root()
+        if trackon_root is None:
+            raise RuntimeError(
+                "No Track-On checkout was found. Set ROBOCUP_TRACKON_ROOT."
+            )
+        checkpoint_path = self._discover_trackon_checkpoint()
+        config_path = self._discover_trackon_config()
+        support_grid_size = max(
+            0,
+            int(os.environ.get("ROBOCUP_TRACKON_SUPPORT_GRID_SIZE", "0")),
+        )
+        helper_path = Path(__file__).resolve().parent / "trackon_subprocess.py"
+        if not helper_path.exists():
+            raise RuntimeError(f"Track-On subprocess helper is missing: {helper_path}")
+
+        request_payload = {
+            "frame_paths": [str(path) for path in frame_paths],
+            "query_specs": [
+                [int(frame_idx), float(x), float(y)]
+                for frame_idx, x, y in query_specs
+            ],
+            "trackon_root": str(trackon_root),
+            "checkpoint_path": str(checkpoint_path),
+            "config_path": str(config_path) if config_path is not None else None,
+            "support_grid_size": support_grid_size,
+            "device": os.environ.get("ROBOCUP_TRACKON_DEVICE", "auto").strip().lower(),
+        }
+        with tempfile.TemporaryDirectory(prefix="robocup_trackon_") as temp_dir:
+            request_path = Path(temp_dir) / "request.json"
+            output_path = Path(temp_dir) / "tracks.npz"
+            request_path.write_text(json.dumps(request_payload), encoding="utf-8")
+            env = os.environ.copy()
+            env["PYTHONPATH"] = (
+                f"{trackon_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
+                if env.get("PYTHONPATH")
+                else str(trackon_root)
+            )
+            timeout_seconds = float(os.environ.get("ROBOCUP_TRACKON_TIMEOUT", "0"))
+            completed = subprocess.run(
+                [
+                    str(python_path),
+                    str(helper_path),
+                    "--request",
+                    str(request_path),
+                    "--output",
+                    str(output_path),
+                ],
+                cwd=str(trackon_root),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds if timeout_seconds > 0 else None,
+                check=False,
+            )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout or "").strip()
+                if len(detail) > 4000:
+                    detail = detail[-4000:]
+                raise RuntimeError(
+                    "Track-On subprocess failed. "
+                    f"Command: {python_path} {helper_path}. {detail}"
+                )
+            if not output_path.exists():
+                raise RuntimeError("Track-On subprocess did not write an output file.")
+
+            with np.load(output_path, allow_pickle=False) as payload:
+                pred_tracks = np.asarray(payload["tracks"], dtype=np.float32)
+                visibility_mask = np.asarray(payload["visibility"], dtype=bool)
+                model_name = str(payload["model_name"].item())
+                device = str(payload["device"].item())
+
+        self.trackon_model_name = f"{model_name}, support_grid={support_grid_size}"
+        self.trackon_device = f"{device} via {python_path}"
+        self.trackon_last_error = None
+        return pred_tracks, visibility_mask
+
+    def _run_trackon_queries(
+        self,
+        frame_paths: list[Path],
+        query_specs: list[tuple[int, float, float]],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        external_python = self._discover_trackon_python()
+        if external_python is not None:
+            return self._run_trackon_subprocess_queries(
+                frame_paths=frame_paths,
+                query_specs=query_specs,
+                python_path=external_python,
+            )
+
+        self._ensure_trackon_loaded()
+        if self.trackon_predictor is None or self.torch is None:
+            raise RuntimeError("Track-On failed to initialize.")
+
+        if not query_specs:
+            return (
+                np.zeros((len(frame_paths), 0, 2), dtype=np.float32),
+                np.zeros((len(frame_paths), 0), dtype=bool),
+            )
+
+        video_frames: list[np.ndarray] = []
+        frame_size: tuple[int, int] | None = None
+        for frame_path in frame_paths:
+            with Image.open(frame_path) as image_handle:
+                frame_array = np.array(image_handle.convert("RGB"))
+            current_size = (frame_array.shape[0], frame_array.shape[1])
+            if frame_size is None:
+                frame_size = current_size
+            elif current_size != frame_size:
+                raise RuntimeError(
+                    "Track-On point propagation requires all selected frames to have the same resolution."
+                )
+            video_frames.append(frame_array)
+
+        video_tensor = self.torch.from_numpy(np.stack(video_frames, axis=0))
+        video_tensor = video_tensor.permute(0, 3, 1, 2).contiguous().float()[None]
+        queries = self.torch.tensor(
+            [[float(frame_idx), x, y] for frame_idx, x, y in query_specs],
+            dtype=self.torch.float32,
+        )[None]
+        if self.trackon_device == "cuda":
+            video_tensor = video_tensor.cuda()
+            queries = queries.cuda()
+
+        with self.torch.inference_mode():
+            pred_tracks, pred_visibility = self.trackon_predictor(
+                video_tensor,
+                queries=queries,
+            )
+
+        pred_tracks = pred_tracks[0].detach().cpu().numpy()
+        pred_visibility = pred_visibility[0].detach().cpu().numpy().astype(bool)
+        return pred_tracks, pred_visibility
+
+    def _run_tapir_queries(
+        self,
+        frame_paths: list[Path],
+        query_specs: list[tuple[int, float, float]],
+        *,
+        model_type: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        model_type = self._tapir_model_type(model_type)
+        self._ensure_tapir_loaded(model_type)
+        if self.tapir_jax is None or self.tapir_model_utils is None:
+            raise RuntimeError("TAPIR failed to initialize.")
+
+        if not query_specs:
+            return (
+                np.zeros((len(frame_paths), 0, 2), dtype=np.float32),
+                np.zeros((len(frame_paths), 0), dtype=bool),
+            )
+
+        video_frames: list[np.ndarray] = []
+        frame_size: tuple[int, int] | None = None
+        for frame_path in frame_paths:
+            with Image.open(frame_path) as image_handle:
+                frame_array = np.array(image_handle.convert("RGB"))
+            current_size = (frame_array.shape[0], frame_array.shape[1])
+            if frame_size is None:
+                frame_size = current_size
+            elif current_size != frame_size:
+                raise RuntimeError(
+                    "TAPIR point propagation requires all selected frames to have the same resolution."
+                )
+            video_frames.append(frame_array)
+
+        if frame_size is None:
+            return (
+                np.zeros((0, len(query_specs), 2), dtype=np.float32),
+                np.zeros((0, len(query_specs)), dtype=bool),
+            )
+
+        image_height, image_width = frame_size
+        default_resolution = "512" if model_type == "bootstapir" else "256"
+        resize_height = max(
+            1,
+            int(os.environ.get("ROBOCUP_TAPIR_RESIZE_HEIGHT", os.environ.get("ROBOCUP_TAPIR_RESOLUTION", default_resolution))),
+        )
+        resize_width = max(
+            1,
+            int(os.environ.get("ROBOCUP_TAPIR_RESIZE_WIDTH", os.environ.get("ROBOCUP_TAPIR_RESOLUTION", default_resolution))),
+        )
+        query_chunk_size = max(1, int(os.environ.get("ROBOCUP_TAPIR_QUERY_CHUNK_SIZE", "32")))
+        resample_filter = getattr(Image, "Resampling", Image).BILINEAR
+        resized_frames = [
+            np.array(
+                Image.fromarray(frame).resize(
+                    (resize_width, resize_height),
+                    resample=resample_filter,
+                )
+            )
+            for frame in video_frames
+        ]
+
+        query_points = np.array(
+            [
+                [
+                    float(frame_idx),
+                    float(y) * resize_height / image_height,
+                    float(x) * resize_width / image_width,
+                ]
+                for frame_idx, x, y in query_specs
+            ],
+            dtype=np.float32,
+        )
+        frames = self.tapir_model_utils.preprocess_frames(
+            np.stack(resized_frames, axis=0)[None]
+        )
+        tapir = self.tapir_predictors[model_type]
+
+        def run_inference(query_chunk):
+            outputs = tapir(
+                video=frames,
+                query_points=query_chunk.astype(np.float32)[None],
+                is_training=False,
+                query_chunk_size=query_chunk_size,
+            )
+            visibles = self.tapir_model_utils.postprocess_occlusions(
+                outputs["occlusion"],
+                outputs["expected_dist"],
+            )
+            return outputs["tracks"][0], visibles[0]
+
+        run_inference = self.tapir_jax.jit(run_inference)
+        track_chunks: list[np.ndarray] = []
+        visibility_chunks: list[np.ndarray] = []
+        for chunk_start in range(0, len(query_points), query_chunk_size):
+            chunk_points = query_points[chunk_start : chunk_start + query_chunk_size]
+            tracks, visibles = run_inference(chunk_points)
+            track_chunks.append(np.asarray(tracks))
+            visibility_chunks.append(np.asarray(visibles))
+
+        tracks_by_query = np.concatenate(track_chunks, axis=0)
+        visibility_by_query = np.concatenate(visibility_chunks, axis=0).astype(bool)
+        pred_tracks = np.zeros(
+            (len(frame_paths), len(query_specs), 2),
+            dtype=np.float32,
+        )
+        pred_tracks[:, :, 0] = (
+            tracks_by_query[:, :, 0].T * image_width / resize_width
+        )
+        pred_tracks[:, :, 1] = (
+            tracks_by_query[:, :, 1].T * image_height / resize_height
+        )
+        visibility_mask = visibility_by_query.T
+        return pred_tracks, visibility_mask
 
     def _run_mask_propagation(
         self,
@@ -1981,6 +2973,7 @@ class Sam2VideoPropagationEngine:
         frame_paths: list[Path],
         ordered_frames: list[TaskFrameSelection],
         *,
+        point_tracker: str,
         backward_tracking: bool,
         completed_steps: int,
         total_steps: int,
@@ -2005,12 +2998,13 @@ class Sam2VideoPropagationEngine:
         if not query_specs:
             return results, completed_steps
 
-        pred_tracks, visibility_mask = self._run_cotracker_queries(
+        pred_tracks, visibility_mask = self._run_point_tracker_queries(
             frame_paths=frame_paths,
             query_specs=[
                 (frame_idx, x, y)
                 for _point_key, _point_id, frame_idx, x, y in query_specs
             ],
+            point_tracker=point_tracker,
             backward_tracking=backward_tracking,
         )
 
@@ -2152,6 +3146,47 @@ class ImageCanvas(QWidget):
         self.objects: list[MaskObject] = []
         self.drag_start: QPointF | None = None
         self.drag_current: QPointF | None = None
+        self.zoom = 1.0
+        self.pan = QPointF(0, 0)
+        self.pan_last: QPointF | None = None
+
+    def reset_zoom(self) -> None:
+        self.zoom = 1.0
+        self.pan = QPointF(0, 0)
+        self.update()
+
+    def _zoom_at(self, position: QPointF, factor: float) -> None:
+        if self.image is None:
+            return
+        old_rect = self._fit_image_rect()
+        x_ratio = (position.x() - old_rect.left()) / max(old_rect.width(), 1e-6)
+        y_ratio = (position.y() - old_rect.top()) / max(old_rect.height(), 1e-6)
+        self.zoom = min(max(self.zoom * factor, 1.0), 40.0)
+        if self.zoom == 1.0:
+            self.pan = QPointF(0, 0)
+        else:
+            # Keep the image pixel under the cursor in place.
+            new_rect = self._fit_image_rect()
+            self.pan += QPointF(
+                position.x() - (new_rect.left() + x_ratio * new_rect.width()),
+                position.y() - (new_rect.top() + y_ratio * new_rect.height()),
+            )
+        self.update()
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        steps = event.angleDelta().y() / 120
+        if steps:
+            self._zoom_at(QPointF(event.position()), 1.25**steps)
+
+    def event(self, event) -> bool:  # noqa: A003
+        # macOS trackpad pinch.
+        if (
+            event.type() == QEvent.Type.NativeGesture
+            and event.gestureType() == Qt.NativeGestureType.ZoomNativeGesture
+        ):
+            self._zoom_at(QPointF(event.position()), 1.0 + event.value())
+            return True
+        return super().event(event)
 
     def set_image(self, image: QImage | None) -> None:
         self.image = image
@@ -2216,7 +3251,16 @@ class ImageCanvas(QWidget):
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         super().mousePressEvent(event)
-        if event.button() != Qt.MouseButton.LeftButton or self.image is None:
+        if self.image is None:
+            return
+        # Pan with right/middle drag, or left drag in the Browse tool.
+        if event.button() in (Qt.MouseButton.RightButton, Qt.MouseButton.MiddleButton) or (
+            event.button() == Qt.MouseButton.LeftButton and self.tool_mode == "browse"
+        ):
+            self.pan_last = QPointF(event.position())
+            self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
             return
 
         widget_pos = QPointF(event.position())
@@ -2243,6 +3287,12 @@ class ImageCanvas(QWidget):
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         super().mouseMoveEvent(event)
+        if self.pan_last is not None:
+            position = QPointF(event.position())
+            self.pan += position - self.pan_last
+            self.pan_last = position
+            self.update()
+            return
         if self.drag_start is None:
             return
         self.drag_current = self._clamp_to_image_rect(QPointF(event.position()))
@@ -2250,6 +3300,10 @@ class ImageCanvas(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         super().mouseReleaseEvent(event)
+        if self.pan_last is not None:
+            self.pan_last = None
+            self.set_tool_state(self.tool_mode, self.sam_prompt_mode)
+            return
         if (
             self.tool_mode != "sam2"
             or self.sam_prompt_mode != "box"
@@ -2295,8 +3349,10 @@ class ImageCanvas(QWidget):
             height = available_height
             width = height * image_ratio
 
-        x = (self.width() - width) / 2
-        y = (self.height() - height) / 2
+        width *= self.zoom
+        height *= self.zoom
+        x = (self.width() - width) / 2 + self.pan.x()
+        y = (self.height() - height) / 2 + self.pan.y()
         return QRectF(x, y, width, height)
 
     def _draw_objects(self, painter: QPainter) -> None:
@@ -2878,6 +3934,7 @@ class LabelingWindow(QMainWindow):
 
         self.folder_path: Path | None = None
         self.image_paths: list[Path] = []
+        self.image_size_cache: dict[Path, tuple[int, int]] = {}
         self.current_index = -1
         self.current_image: QImage | None = None
         self.current_path: Path | None = None
@@ -2900,6 +3957,10 @@ class LabelingWindow(QMainWindow):
         self.selected_timeline_points: set[str] = set()
         self.undo_stack: list[AppStateSnapshot] = []
         self.redo_stack: list[AppStateSnapshot] = []
+        self.autosave_dirty = False
+        self.autosave_timer = QTimer(self)
+        self.autosave_timer.timeout.connect(self._autosave)
+        self.autosave_timer.start(30_000)
         self.max_history_depth = 50
         self.scene_watch_root: Path | None = None
         self.scene_watch_poll_interval_ms = 3000
@@ -2959,6 +4020,14 @@ class LabelingWindow(QMainWindow):
         self.scan_scene_watch_now_action = QAction("Scan Incoming Scenes Now", self)
         self.scan_scene_watch_now_action.triggered.connect(
             self.scan_incoming_scene_root_now
+        )
+
+        self.autolabel_frame_folder_action = QAction(
+            "Autolabel Frame Folder",
+            self,
+        )
+        self.autolabel_frame_folder_action.triggered.connect(
+            self.choose_frame_folder_for_autolabeling
         )
 
         self.export_coco_action = QAction("Export COCO Annotations", self)
@@ -3149,6 +4218,7 @@ class LabelingWindow(QMainWindow):
         tools_menu.addAction(self.set_scene_watch_root_action)
         tools_menu.addAction(self.toggle_scene_watch_action)
         tools_menu.addAction(self.scan_scene_watch_now_action)
+        tools_menu.addAction(self.autolabel_frame_folder_action)
 
         export_menu = self.menuBar().addMenu("Export")
         export_menu.addAction(self.export_coco_action)
@@ -3156,7 +4226,10 @@ class LabelingWindow(QMainWindow):
         export_menu.addAction(self.export_coco_keypoints_only_action)
 
         view_menu = self.menuBar().addMenu("View")
-        view_menu.addAction("Fit To Window", lambda: self.canvas.update())
+        fit_action = QAction("Fit To Window", self)
+        fit_action.setShortcut(QKeySequence("0"))
+        fit_action.triggered.connect(lambda: self.canvas.reset_zoom())
+        view_menu.addAction(fit_action)
         view_menu.addSeparator()
         view_menu.addAction(self.show_ids_action)
         view_menu.addSeparator()
@@ -3200,7 +4273,7 @@ class LabelingWindow(QMainWindow):
         title = QLabel("RoboCup Labeling")
         title.setObjectName("appTitle")
         subtitle = QLabel(
-            "X-AnyLabeling-style workspace with keypoints, SAM2 prompts, and propagation task selection"
+            "Supports automatic object and keypoint annotation and label propagation through video."
         )
         subtitle.setObjectName("appSubtitle")
         title_block.addWidget(title)
@@ -3230,7 +4303,7 @@ class LabelingWindow(QMainWindow):
 
         return header
 
-    def _build_tool_rail(self) -> QWidget:
+    def _build_tool_rail(self) -> QScrollArea:
         rail = QFrame()
         rail.setObjectName("toolRail")
         rail.setFixedWidth(96)
@@ -3287,7 +4360,7 @@ class LabelingWindow(QMainWindow):
         layout.addWidget(self.toggle_timeline_button)
 
         layout.addStretch(1)
-        return rail
+        return self._make_scrollable(rail)
 
     def _build_workspace(self) -> QWidget:
         workspace = QWidget()
@@ -3329,7 +4402,7 @@ class LabelingWindow(QMainWindow):
 
         return workspace
 
-    def _build_sidebar(self) -> QWidget:
+    def _build_sidebar(self) -> QScrollArea:
         sidebar = QWidget()
         sidebar.setFixedWidth(340)
 
@@ -3473,7 +4546,18 @@ class LabelingWindow(QMainWindow):
         files_layout.addWidget(self.file_list)
         layout.addWidget(files_panel, 1)
 
-        return sidebar
+        return self._make_scrollable(sidebar)
+
+    def _make_scrollable(self, widget: QWidget) -> QScrollArea:
+        # Scroll instead of squashing the contents when the window is shorter than they are.
+        scroll = QScrollArea()
+        scroll.setWidget(widget)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        scroll.setFixedWidth(widget.width() + scroll.verticalScrollBar().sizeHint().width())
+        return scroll
 
     def _build_bottom_dock(self) -> None:
         self.bottom_dock = QDockWidget("Timeline / Tasks", self)
@@ -3560,8 +4644,11 @@ class LabelingWindow(QMainWindow):
         button_row.addWidget(self.reverse_task_checkbox)
 
         self.point_tracker_selector = QComboBox()
-        self.point_tracker_selector.addItem("Points: SAM2", "sam2")
+        self.point_tracker_selector.addItem("Points: SAM-PT/SAM2", "sam2")
         self.point_tracker_selector.addItem("Points: CoTracker", "cotracker")
+        self.point_tracker_selector.addItem("Points: TAPIR", "tapir")
+        self.point_tracker_selector.addItem("Points: BootsTAPIR", "bootstapir")
+        self.point_tracker_selector.addItem("Points: Track-On", "trackon")
         button_row.addWidget(self.point_tracker_selector)
 
         self.delete_timeline_objects_button = QPushButton(
@@ -4219,6 +5306,58 @@ class LabelingWindow(QMainWindow):
             return
         self._set_scene_watch_root(Path(folder), start_watch=True)
 
+    def choose_frame_folder_for_autolabeling(self) -> None:
+        if self.folder_path is not None:
+            start_dir = str(self.folder_path)
+        elif self.scene_watch_root is not None:
+            start_dir = str(self.scene_watch_root)
+        else:
+            start_dir = str(Path.home())
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select RGB Frame Folder",
+            start_dir,
+        )
+        if not folder:
+            return
+
+        frame_folder = Path(folder)
+        if not self._scene_has_supported_images(frame_folder):
+            QMessageBox.information(
+                self,
+                "No RGB Frames Found",
+                "The selected folder does not contain supported image frames.",
+            )
+            return
+
+        autolabel_mode = _current_autolabeling_mode()
+        classes_file: Path | None = None
+        class_specs: list[VocabularyClassSpec] = []
+        if autolabel_mode == "objects":
+            classes_file = self.app_root / "robocup_labeling_app" / "classes.txt"
+            class_specs = self._parse_scene_classes_file(classes_file)
+            if not classes_file.exists() or not class_specs:
+                QMessageBox.warning(
+                    self,
+                    "Classes File Required",
+                    f"Object autolabeling needs a non-empty classes file at {classes_file}.",
+                )
+                return
+
+        request = OpenVocabularyDetectionRequest(
+            scene_name=frame_folder.name,
+            scene_path=frame_folder,
+            image_dir=frame_folder,
+            classes_file=classes_file,
+            class_specs=copy.deepcopy(class_specs),
+        )
+        processing_message = self._enqueue_scene_background_task(request)
+        self.scene_watch_result_label.setText(f"Detector hook: {processing_message}")
+        self.bottom_tabs.setCurrentWidget(self.tasks_tab)
+        self.status_bar.showMessage(
+            f"Queued frame-folder autolabeling for {frame_folder.name}"
+        )
+
     def _set_scene_watch_root(self, root: Path, *, start_watch: bool) -> None:
         self.scene_watch_root = root
         self.scene_watch_processed = self._existing_scene_folder_keys(root)
@@ -4228,11 +5367,7 @@ class LabelingWindow(QMainWindow):
         self.scene_watch_result_label.setText(
             "Detector hook: baseline recorded for "
             f"{len(self.scene_watch_processed)} existing scene folder(s); "
-            + (
-                "app-folder classes.txt will be used for new scenes"
-                if autolabel_mode != "tshirt"
-                else "tshirt autolabeling mode will use OpenRouter keypoint extraction"
-            )
+            + self._autolabel_mode_description(autolabel_mode)
         )
         if start_watch:
             self.scene_watch_timer.start()
@@ -4269,7 +5404,7 @@ class LabelingWindow(QMainWindow):
         autolabel_mode = _current_autolabeling_mode()
         classes_file: Path | None = None
         class_specs: list[VocabularyClassSpec] = []
-        if autolabel_mode != "tshirt":
+        if autolabel_mode == "objects":
             classes_file = self.app_root / "robocup_labeling_app" / "classes.txt"
             if not classes_file.exists():
                 self.scene_watch_result_label.setText(
@@ -4316,6 +5451,8 @@ class LabelingWindow(QMainWindow):
 
             if autolabel_mode == "tshirt":
                 class_labels = "tshirt keypoints"
+            elif autolabel_mode == "keypoints":
+                class_labels = "keypoints"
             else:
                 class_labels = ", ".join(spec.label for spec in class_specs[:4])
                 if len(class_specs) > 4:
@@ -4412,6 +5549,13 @@ class LabelingWindow(QMainWindow):
                 f"Detector hook: waiting for scene folders ({processed_count} processed)"
             )
 
+    def _autolabel_mode_description(self, autolabel_mode: str) -> str:
+        if autolabel_mode == "tshirt":
+            return "tshirt autolabeling mode will use OpenRouter keypoint extraction"
+        if autolabel_mode == "keypoints":
+            return "keypoint autolabeling mode will use OpenRouter Gemini Flash and the selected point tracker"
+        return "app-folder classes.txt will be used for new scenes"
+
     def _enqueue_scene_background_task(
         self,
         request: OpenVocabularyDetectionRequest,
@@ -4473,6 +5617,13 @@ class LabelingWindow(QMainWindow):
         try:
             if task.autolabel_mode == "tshirt":
                 message, output_path = _run_tshirt_scene_processing_pipeline(
+                    task,
+                    workspace_root=self.workspace_root,
+                    package_root=self.sam2_bundle_root,
+                    progress_callback=report,
+                )
+            elif task.autolabel_mode == "keypoints":
+                message, output_path = _run_keypoint_scene_processing_pipeline(
                     task,
                     workspace_root=self.workspace_root,
                     package_root=self.sam2_bundle_root,
@@ -4586,7 +5737,7 @@ class LabelingWindow(QMainWindow):
         if row < 0 or row >= len(self.scene_background_tasks):
             return
         task = self.scene_background_tasks[row]
-        self.load_image_folder(task.request.image_dir)
+        self.load_image_folder(task.request.image_dir, downscale=False)
         output_path = Path(task.output_path)
         if output_path.exists():
             try:
@@ -4605,11 +5756,134 @@ class LabelingWindow(QMainWindow):
         request: OpenVocabularyDetectionRequest,
         autolabel_mode: str = "objects",
     ) -> Path:
+        if autolabel_mode == "keypoints":
+            point_tracker = _current_keypoint_tracker_backend()
+            if point_tracker == "cotracker":
+                return request.image_dir / "coco_annotations_auto_keypoints.json"
+            return request.image_dir / f"coco_annotations_auto_keypoints_{point_tracker}.json"
         if autolabel_mode == "tshirt":
             return request.image_dir / "coco_annotations_auto_keypoints.json"
         return request.image_dir / "coco_annotations_auto.json"
 
-    def load_image_folder(self, folder: Path) -> None:
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._autosave()
+        super().closeEvent(event)
+
+    def _autosave(self) -> None:
+        if not self.autosave_dirty or self.folder_path is None:
+            return
+        target = self.folder_path / AUTOSAVE_FILE_NAME
+        temp_path = target.with_suffix(".tmp")
+        try:
+            self._write_coco_annotations_to_path(
+                temp_path, include_objects=True, include_points=True
+            )
+            os.replace(temp_path, target)  # never leave a half-written autosave behind
+        except Exception as exc:  # noqa: BLE001
+            self.status_bar.showMessage(f"Autosave failed: {exc}")
+            return
+        self.autosave_dirty = False
+
+    def _restore_autosave(self) -> None:
+        autosave_path = self.folder_path / AUTOSAVE_FILE_NAME
+        if not autosave_path.exists():
+            return
+        try:
+            objects, points, _skipped = self._import_coco_annotations_from_path(autosave_path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(
+                self,
+                "Autosave Not Restored",
+                f"Could not read {autosave_path.name}; it was left untouched.\n{exc}",
+            )
+            return
+        # Undo must not be able to wipe the restored labels.
+        self.undo_stack = []
+        self.redo_stack = []
+        self.autosave_dirty = False
+        self._update_history_actions()
+        self._sync_canvas_and_lists()
+        self.status_bar.showMessage(
+            f"Restored autosave: {objects} objects and {points} points"
+        )
+
+    def _downscaled_folder(self, folder: Path) -> Path | None:
+        """Return a folder of photos no larger than MAX_LABELING_SIDE, converting new ones."""
+        if MAX_LABELING_SIDE <= 0:
+            return folder
+        sources = sorted(
+            path for path in folder.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS
+        )
+
+        def needs_downscale(path: Path) -> bool:
+            if path.suffix.lower() in {".heic", ".heif"}:
+                return True
+            try:
+                with Image.open(path) as image:
+                    return max(image.size) > MAX_LABELING_SIDE
+            except Exception:  # noqa: BLE001
+                return False
+
+        if not any(needs_downscale(path) for path in sources):
+            return folder
+
+        target_folder = folder / f"labeling_{MAX_LABELING_SIDE}"
+        target_folder.mkdir(exist_ok=True)
+        jobs: list[tuple[Path, Path]] = []
+        used_names: set[str] = set()
+        for source in sources:
+            name = f"{source.stem}.jpg"
+            if name in used_names:  # e.g. IMG_1.HEIC next to IMG_1.JPG
+                name = f"{source.stem}_{source.suffix.lstrip('.').lower()}.jpg"
+            used_names.add(name)
+            target = target_folder / name
+            if not target.exists() or target.stat().st_mtime < source.stat().st_mtime:
+                jobs.append((source, target))
+
+        progress = QProgressDialog(
+            f"Downscaling photos to {MAX_LABELING_SIDE} px...", "Cancel", 0, len(jobs), self
+        )
+        progress.setWindowTitle("Preparing Images")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        failed: list[str] = []
+        for done, (source, target) in enumerate(jobs):
+            progress.setValue(done)
+            progress.setLabelText(f"Downscaling {source.name} ({done + 1}/{len(jobs)})")
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                break
+            try:
+                with Image.open(source) as image:
+                    image = ImageOps.exif_transpose(image).convert("RGB")
+                    image.thumbnail(
+                        (MAX_LABELING_SIDE, MAX_LABELING_SIDE), Image.Resampling.LANCZOS
+                    )
+                    temp_target = target.with_name(f"{target.name}.tmp")
+                    image.save(temp_target, format="JPEG", quality=95)
+                    os.replace(temp_target, target)
+            except Exception:  # noqa: BLE001
+                failed.append(source.name)
+        canceled = progress.wasCanceled()
+        progress.setValue(len(jobs))  # closing a QProgressDialog would also count as "Cancel"
+        if canceled:
+            return None
+        if failed:
+            QMessageBox.warning(
+                self,
+                "Some Photos Skipped",
+                "Could not convert:\n" + "\n".join(failed[:20]),
+            )
+        return target_folder
+
+    def load_image_folder(self, folder: Path, *, downscale: bool = True) -> None:
+        self._autosave()
+        # Scene task outputs are in original-resolution coordinates, so those load as-is.
+        downscaled = self._downscaled_folder(folder) if downscale else folder
+        if downscaled is None:
+            self.status_bar.showMessage("Folder loading cancelled")
+            return
+        folder = downscaled
         image_paths = sorted(
             path for path in folder.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS
         )
@@ -4648,6 +5922,7 @@ class LabelingWindow(QMainWindow):
         self.status_bar.showMessage(
             f"Loaded {len(self.image_paths)} images from {folder}"
         )
+        self._restore_autosave()
 
     def _on_file_selected(self) -> None:
         row = self.file_list.currentRow()
@@ -4662,6 +5937,16 @@ class LabelingWindow(QMainWindow):
         reader = QImageReader(str(image_path))
         reader.setAutoTransform(True)
         image = reader.read()
+        if image.isNull():
+            # Qt has no reader for some formats (e.g. HEIC); decode with Pillow instead.
+            try:
+                with Image.open(image_path) as pil_image:
+                    rgb = np.ascontiguousarray(ImageOps.exif_transpose(pil_image).convert("RGB"))
+                image = QImage(
+                    rgb.data, rgb.shape[1], rgb.shape[0], rgb.strides[0], QImage.Format.Format_RGB888
+                ).copy()
+            except Exception:  # noqa: BLE001
+                pass
         if image.isNull():
             QMessageBox.critical(
                 self,
@@ -4772,13 +6057,8 @@ class LabelingWindow(QMainWindow):
             )
             return
 
-        label, accepted = QInputDialog.getText(
-            self,
-            "Finish SAM2 Object",
-            "Object label:",
-            text=self.last_object_label,
-        )
-        if not accepted or not label.strip():
+        label = self._ask_object_label("Finish SAM2 Object", self.last_object_label)
+        if not label:
             return
 
         self.last_object_label = label.strip()
@@ -5250,6 +6530,24 @@ class LabelingWindow(QMainWindow):
             )
         self.object_count_label.setText(f"Objects in image: {len(objects)}")
 
+    def _ask_object_label(self, title: str, text: str) -> str | None:
+        """Ask for a label, suggesting the labels already used in this folder."""
+        existing_labels = sorted(
+            {obj.label for objects in self.object_annotations.values() for obj in objects},
+            key=str.lower,
+        )
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.setLabelText("Object label:")
+        dialog.setTextValue(text)
+        completer = QCompleter(existing_labels, dialog)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        dialog.findChild(QLineEdit).setCompleter(completer)
+        if not dialog.exec():
+            return None
+        return dialog.textValue().strip() or None
+
     def _edit_object_label_from_item(self, item: QListWidgetItem) -> None:
         if self.current_path is None:
             return
@@ -5260,13 +6558,8 @@ class LabelingWindow(QMainWindow):
             return
 
         obj = objects[row]
-        label, accepted = QInputDialog.getText(
-            self,
-            "Edit Object Label",
-            "Object label:",
-            text=obj.label,
-        )
-        if not accepted or not label.strip() or label.strip() == obj.label:
+        label = self._ask_object_label("Edit Object Label", obj.label)
+        if not label or label == obj.label:
             return
 
         new_label = label.strip()
@@ -5596,12 +6889,12 @@ class LabelingWindow(QMainWindow):
 
     def _capture_app_state(self) -> AppStateSnapshot:
         return AppStateSnapshot(
-            point_annotations=copy.deepcopy(self.point_annotations),
-            sam2_prompt_points=copy.deepcopy(self.sam2_prompt_points),
-            sam2_prompt_boxes=copy.deepcopy(self.sam2_prompt_boxes),
-            sam2_preview_masks=copy.deepcopy(self.sam2_preview_masks),
-            object_annotations=copy.deepcopy(self.object_annotations),
-            propagation_tasks=copy.deepcopy(self.propagation_tasks),
+            point_annotations=_copy_sharing_arrays(self.point_annotations),
+            sam2_prompt_points=_copy_sharing_arrays(self.sam2_prompt_points),
+            sam2_prompt_boxes=_copy_sharing_arrays(self.sam2_prompt_boxes),
+            sam2_preview_masks=_copy_sharing_arrays(self.sam2_preview_masks),
+            object_annotations=_copy_sharing_arrays(self.object_annotations),
+            propagation_tasks=_copy_sharing_arrays(self.propagation_tasks),
             current_index=self.current_index,
             timeline_panel_mode=self.timeline_panel_mode,
             selected_object_time_window=self.selected_object_time_window,
@@ -5611,12 +6904,13 @@ class LabelingWindow(QMainWindow):
         )
 
     def _apply_app_state(self, state: AppStateSnapshot) -> None:
-        self.point_annotations = copy.deepcopy(state.point_annotations)
-        self.sam2_prompt_points = copy.deepcopy(state.sam2_prompt_points)
-        self.sam2_prompt_boxes = copy.deepcopy(state.sam2_prompt_boxes)
-        self.sam2_preview_masks = copy.deepcopy(state.sam2_preview_masks)
-        self.object_annotations = copy.deepcopy(state.object_annotations)
-        self.propagation_tasks = copy.deepcopy(state.propagation_tasks)
+        self.autosave_dirty = True
+        self.point_annotations = _copy_sharing_arrays(state.point_annotations)
+        self.sam2_prompt_points = _copy_sharing_arrays(state.sam2_prompt_points)
+        self.sam2_prompt_boxes = _copy_sharing_arrays(state.sam2_prompt_boxes)
+        self.sam2_preview_masks = _copy_sharing_arrays(state.sam2_preview_masks)
+        self.object_annotations = _copy_sharing_arrays(state.object_annotations)
+        self.propagation_tasks = _copy_sharing_arrays(state.propagation_tasks)
         self.timeline_panel_mode = state.timeline_panel_mode
         self.selected_object_time_window = state.selected_object_time_window
         self.selected_point_time_window = state.selected_point_time_window
@@ -5631,6 +6925,7 @@ class LabelingWindow(QMainWindow):
         self._refresh_task_list()
 
     def _record_history_state(self) -> None:
+        self.autosave_dirty = True
         self.undo_stack.append(self._capture_app_state())
         if len(self.undo_stack) > self.max_history_depth:
             self.undo_stack.pop(0)
@@ -5669,12 +6964,22 @@ class LabelingWindow(QMainWindow):
     def _image_size_for_path(self, image_path: Path) -> tuple[int, int]:
         if self.current_path == image_path and self.current_image is not None:
             return self.current_image.width(), self.current_image.height()
-        reader = QImageReader(str(image_path))
-        size = reader.size()
-        if size.isValid():
-            return size.width(), size.height()
-        image = Image.open(image_path)
-        return image.width, image.height
+        cached = self.image_size_cache.get(image_path)
+        if cached is not None:
+            return cached
+        try:
+            # Report the size as displayed, i.e. after applying the EXIF rotation.
+            # Header only: decoding every photo froze autosave for minutes on iCloud folders.
+            with Image.open(image_path) as image:
+                width, height = image.size
+                if image.getexif().get(0x0112, 1) in (5, 6, 7, 8):
+                    width, height = height, width
+        except Exception:  # noqa: BLE001
+            reader = QImageReader(str(image_path))
+            size = reader.size()
+            width, height = size.width(), size.height()
+        self.image_size_cache[image_path] = (width, height)
+        return width, height
 
     def _coerce_image_size(
         self,
@@ -5922,24 +7227,7 @@ class LabelingWindow(QMainWindow):
         return mask
 
     def _encode_mask_to_rle(self, mask: np.ndarray) -> dict[str, object]:
-        flat_mask = mask.astype(np.uint8).flatten(order="F")
-        counts: list[int] = []
-        current_value = 0
-        run_length = 0
-
-        for value in flat_mask:
-            if int(value) == current_value:
-                run_length += 1
-                continue
-            counts.append(run_length)
-            run_length = 1
-            current_value = int(value)
-        counts.append(run_length)
-
-        return {
-            "size": [int(mask.shape[0]), int(mask.shape[1])],
-            "counts": counts,
-        }
+        return _encode_mask_to_rle_static(mask)
 
     def _bbox_to_coco(
         self,

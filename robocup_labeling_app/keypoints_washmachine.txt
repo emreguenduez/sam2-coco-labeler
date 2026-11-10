@@ -1,0 +1,2 @@
+Extract the following keypoint from the image:
+- Door Handle Of The Washmachine
