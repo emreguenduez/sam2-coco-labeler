@@ -4230,6 +4230,10 @@ class LabelingWindow(QMainWindow):
         fit_action.setShortcut(QKeySequence("0"))
         fit_action.triggered.connect(lambda: self.canvas.reset_zoom())
         view_menu.addAction(fit_action)
+        first_unannotated_action = QAction("Go To First Unannotated Image", self)
+        first_unannotated_action.setShortcut(QKeySequence("U"))
+        first_unannotated_action.triggered.connect(self.show_first_unannotated_image)
+        view_menu.addAction(first_unannotated_action)
         view_menu.addSeparator()
         view_menu.addAction(self.show_ids_action)
         view_menu.addSeparator()
@@ -7410,6 +7414,20 @@ class LabelingWindow(QMainWindow):
         if not self.image_paths:
             return
         self.show_image_at_index((self.current_index - 1) % len(self.image_paths))
+
+    def show_first_unannotated_image(self) -> None:
+        if not self.image_paths:
+            self.status_bar.showMessage("Open an image folder first")
+            return
+        for index, path in enumerate(self.image_paths):
+            key = str(path)
+            if not self.object_annotations.get(key) and not self.point_annotations.get(key):
+                self.show_image_at_index(index)
+                self.status_bar.showMessage(
+                    f"First unannotated image: {path.name} ({index + 1}/{len(self.image_paths)})"
+                )
+                return
+        self.status_bar.showMessage(f"All {len(self.image_paths)} images have annotations")
 
     def show_next_image(self) -> None:
         if not self.image_paths:

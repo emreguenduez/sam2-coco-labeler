@@ -14,7 +14,7 @@ masks and keypoints, exported as COCO. The interface is inspired by X-AnyLabelin
 - Classic top menu bar with `File`, `Tools`, `Export`, `View`, and `Help`
 - Open an image folder with `Ctrl+U`, including iPhone HEIC photos; large photos are downscaled on import (see [Importing photos](#importing-photos))
 - Automatically show the first image in the selected folder
-- Navigate between images with the left and right arrow keys
+- Navigate between images with the left and right arrow keys, or press `U` (`View > Go To First Unannotated Image`) to jump to the first image that has no masks or keypoints yet
 - Zoom with the scroll wheel or a trackpad pinch, pan with a right-drag (or a left-drag with the Browse tool), and press `0` or use `View > Fit To Window` to fit the image again
 - Point tool for placing keypoints directly on the image
 - Unique point ids per image, with optional id visualization on the canvas
@@ -90,7 +90,7 @@ The autosave is overwritten as you work; use `Export` for a finished copy.
 - Track-On uses the official `track_on` implementation when installed; set `ROBOCUP_TRACKON_ROOT` to the local checkout, `ROBOCUP_TRACKON_CHECKPOINT` to a Track-On checkpoint, optionally set `ROBOCUP_TRACKON_CONFIG`, tune `ROBOCUP_TRACKON_SUPPORT_GRID_SIZE` (default `0`), and set `ROBOCUP_TRACKON_PYTHON` to run Track-On in a separate environment while keeping the app in its usual environment
 - Use `Tools > Autolabel Frame Folder` to select a folder containing the RGB frames for one video and process it as a background task
 - COCO export writes object masks as RLE segmentations and points as point-style annotations in the same JSON file
-- Useful shortcuts: `Ctrl+U` opens an image folder, left/right arrows change frame, `F` finishes the current SAM2 mask, `B` clears SAM2 prompts, `0` fits the image to the window, and `Ctrl+A` selects all frames when the timeline panel is focused
+- Useful shortcuts: `Ctrl+U` opens an image folder, left/right arrows change frame, `F` finishes the current SAM2 mask, `B` clears SAM2 prompts, `0` fits the image to the window, `U` jumps to the first unannotated image, and `Ctrl+A` selects all frames when the timeline panel is focused
 
 ## Optional TAPIR / BootsTAPIR Setup
 
