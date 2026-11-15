@@ -21,7 +21,7 @@ masks and keypoints, exported as COCO. The interface is inspired by X-AnyLabelin
 - SAM2 prompt mode with point and box prompts for a single object
 - Immediate grey mask preview from SAM2 while prompts are being added
 - Finish the current SAM2 preview as a labeled object with its own object id
-- Label prompts autocomplete from the labels already used in the open folder (case-insensitive, matching any part of the label)
+- Label prompts autocomplete from the labels already used in the open folder: typing fills in the best match, the first `Enter` accepts it and the second presses OK (`Backspace` keeps just what you typed, `Up`/`Down` pick another match). The `Match` setting in the prompt switches between the beginning of the label (default), the beginning of any word (`cream` finds `hand_cream`) and anywhere in the label, and is remembered
 - Rename an object by double-clicking it in the Objects list; the new label applies to that object in every image
 - Incoming-scene autolabeling for objects or keypoints
 - One-off autolabeling for a folder containing RGB video frames

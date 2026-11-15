@@ -27,7 +27,7 @@ try:  # iPhone photos are often HEIC, sometimes even with a .jpeg extension.
     register_heif_opener()
 except ImportError:
     pass
-from PyQt6.QtCore import QEvent, QLineF, QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QLineF, QPointF, QRectF, QSettings, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QActionGroup,
@@ -42,8 +42,9 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
-    QCompleter,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDockWidget,
     QFileDialog,
     QFrame,
@@ -3122,6 +3123,129 @@ class Sam2VideoPropagationEngine:
         y_min, x_min = positions.min(axis=0)
         y_max, x_max = positions.max(axis=0)
         return int(x_min), int(y_min), int(x_max), int(y_max)
+
+
+class LabelPromptDialog(QDialog):
+    """Label input with inline completion: the first Enter takes the suggestion, the next one is OK."""
+
+    MATCH_MODES = [
+        ("start", "Beginning of label"),
+        ("word", "Beginning of any word"),
+        ("anywhere", "Anywhere in label"),
+    ]
+
+    def __init__(self, parent: QWidget, title: str, text: str, labels: list[str]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.labels = labels
+        self.typed = text
+        self.settings = QSettings("sam2-coco-labeler", "sam2-coco-labeler")
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Object label:"))
+        self.edit = QLineEdit(text)
+        self.edit.selectAll()
+        self.edit.installEventFilter(self)
+        self.edit.textEdited.connect(self._on_text_edited)
+        layout.addWidget(self.edit)
+
+        self.matches = QListWidget()
+        self.matches.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.matches.setMaximumHeight(140)
+        self.matches.itemClicked.connect(lambda item: self._use(item.text()))
+        self.matches.itemDoubleClicked.connect(lambda item: (self._use(item.text()), self.accept()))
+        self.matches.setVisible(bool(labels))
+        layout.addWidget(self.matches)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Match:"))
+        self.mode = QComboBox()
+        for key, name in self.MATCH_MODES:
+            self.mode.addItem(name, key)
+        self.mode.setCurrentIndex(max(self.mode.findData(self.settings.value("label_match_mode", "start")), 0))
+        self.mode.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.mode.currentIndexChanged.connect(self._on_mode_changed)
+        mode_row.addWidget(self.mode, 1)
+        layout.addLayout(mode_row)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._refresh(select_first=False)
+
+    def label(self) -> str:
+        return self.edit.text().strip()
+
+    def _matching(self, label: str) -> bool:
+        needle = self.typed.strip().lower()
+        if not needle:
+            return True
+        lowered = label.lower()
+        mode = self.mode.currentData()
+        if mode == "anywhere":
+            return needle in lowered
+        if mode == "word":
+            return any(word.startswith(needle) for word in re.split(r"[\s_\-]+", lowered))
+        return lowered.startswith(needle)
+
+    def _refresh(self, select_first: bool) -> None:
+        self.matches.clear()
+        self.matches.addItems([label for label in self.labels if self._matching(label)])
+        if select_first and self.matches.count():
+            self.matches.setCurrentRow(0)
+
+    def _on_text_edited(self, text: str) -> None:
+        grew = len(text) > len(self.typed)  # typing, not deleting
+        self.typed = text
+        self._refresh(select_first=grew and bool(text.strip()))
+        suggestion = self.matches.currentItem()
+        if suggestion is None:
+            return
+        full = suggestion.text()
+        if len(full) > len(text) and full.lower().startswith(text.lower()):
+            # Fill in the rest, selected, so further typing replaces it.
+            self.edit.setText(full)
+            self.edit.setSelection(len(text), len(full) - len(text))
+
+    def _on_mode_changed(self) -> None:
+        self.settings.setValue("label_match_mode", self.mode.currentData())
+        self._refresh(select_first=bool(self.typed.strip()))
+        self.edit.setFocus()
+
+    def _use(self, label: str) -> None:
+        self.edit.setText(label)
+        self.typed = label
+        self.edit.setFocus()
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if obj is self.edit and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                text = self.edit.text()
+                if self.edit.hasSelectedText() and 0 < self.edit.selectionStart() and (
+                    self.edit.selectionStart() + len(self.edit.selectedText()) == len(text)
+                ):
+                    self._use(text)  # accept the inline completion
+                    return True
+                suggestion = self.matches.currentItem()
+                if suggestion is not None and suggestion.text() != text:
+                    self._use(suggestion.text())
+                    return True
+            elif key in (Qt.Key.Key_Up, Qt.Key.Key_Down) and self.matches.count():
+                step = 1 if key == Qt.Key.Key_Down else -1
+                row = min(max(self.matches.currentRow() + step, 0), self.matches.count() - 1)
+                self.matches.setCurrentRow(row)
+                full = self.matches.item(row).text()
+                if full.lower().startswith(self.typed.lower()):
+                    self.edit.setText(full)
+                    self.edit.setSelection(len(self.typed), len(full) - len(self.typed))
+                else:
+                    self.edit.setText(self.typed)  # Enter then takes the highlighted match
+                return True
+        return super().eventFilter(obj, event)
 
 
 class ImageCanvas(QWidget):
@@ -6562,17 +6686,10 @@ class LabelingWindow(QMainWindow):
             {obj.label for objects in self.object_annotations.values() for obj in objects},
             key=str.lower,
         )
-        dialog = QInputDialog(self)
-        dialog.setWindowTitle(title)
-        dialog.setLabelText("Object label:")
-        dialog.setTextValue(text)
-        completer = QCompleter(existing_labels, dialog)
-        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        completer.setFilterMode(Qt.MatchFlag.MatchContains)
-        dialog.findChild(QLineEdit).setCompleter(completer)
+        dialog = LabelPromptDialog(self, title, text, existing_labels)
         if not dialog.exec():
             return None
-        return dialog.textValue().strip() or None
+        return dialog.label() or None
 
     def _edit_object_label_from_item(self, item: QListWidgetItem) -> None:
         if self.current_path is None:
