@@ -5815,19 +5815,41 @@ class LabelingWindow(QMainWindow):
             path for path in folder.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS
         )
 
-        def needs_downscale(path: Path) -> bool:
-            if path.suffix.lower() in {".heic", ".heif"}:
-                return True
-            try:
-                with Image.open(path) as image:
-                    return max(image.size) > MAX_LABELING_SIDE
-            except Exception:  # noqa: BLE001
-                return False
-
-        if not any(needs_downscale(path) for path in sources):
-            return folder
-
         target_folder = folder / f"labeling_{MAX_LABELING_SIDE}"
+        if folder.name == target_folder.name:  # the app's own downscaled output
+            return folder
+        if not target_folder.exists() and not any(
+            path.suffix.lower() in {".heic", ".heif"} for path in sources
+        ):
+            # Reading a header can mean downloading the whole photo from iCloud,
+            # so check sizes behind a cancellable progress dialog.
+            checking = QProgressDialog(
+                "Checking photo sizes...", "Cancel", 0, len(sources), self
+            )
+            checking.setWindowTitle("Preparing Images")
+            checking.setWindowModality(Qt.WindowModality.WindowModal)
+            checking.setMinimumDuration(0)
+            too_large = False
+            for done, path in enumerate(sources):
+                checking.setValue(done)
+                checking.setLabelText(f"Checking {path.name} ({done + 1}/{len(sources)})")
+                QApplication.processEvents()
+                if checking.wasCanceled():
+                    break
+                try:
+                    with Image.open(path) as image:
+                        too_large = max(image.size) > MAX_LABELING_SIDE
+                except Exception:  # noqa: BLE001
+                    too_large = False
+                if too_large:
+                    break
+            canceled = checking.wasCanceled()
+            checking.setValue(len(sources))  # closing a QProgressDialog would also count as "Cancel"
+            if canceled:
+                return None
+            if not too_large:
+                return folder
+
         target_folder.mkdir(exist_ok=True)
         jobs: list[tuple[Path, Path]] = []
         used_names: set[str] = set()
