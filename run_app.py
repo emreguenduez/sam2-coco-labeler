@@ -1,4 +1,4 @@
-from robocup_labeling_app.main import main
+from sam2_coco_labeler.main import main
 
 
 if __name__ == "__main__":

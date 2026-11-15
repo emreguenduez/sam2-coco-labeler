@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-time setup of the RoboCup labeling app on macOS (Apple Silicon or Intel).
+# One-time setup of SAM2 COCO Labeler on macOS (Apple Silicon or Intel).
 # Creates a local virtual environment in .venv with everything needed for
 # SAM2-assisted mask annotation and COCO export.
 set -euo pipefail

@@ -4,7 +4,7 @@ import sys
 def main() -> None:
     try:
         from PyQt6.QtWidgets import QApplication
-        from robocup_labeling_app.viewer import LabelingWindow
+        from sam2_coco_labeler.viewer import LabelingWindow
     except ModuleNotFoundError as exc:
         if exc.name == "PyQt6":
             raise SystemExit(
@@ -13,7 +13,7 @@ def main() -> None:
         raise
 
     app = QApplication(sys.argv)
-    app.setApplicationName("RoboCup Labeling")
+    app.setApplicationName("SAM2 COCO Labeler")
     window = LabelingWindow()
     window.show()
     sys.exit(app.exec())

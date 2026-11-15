@@ -73,7 +73,7 @@ def run_trackon(request: dict[str, object]) -> tuple[np.ndarray, np.ndarray, str
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run Track-On inference for RoboCup Labeling.")
+    parser = argparse.ArgumentParser(description="Run Track-On inference for SAM2 COCO Labeler.")
     parser.add_argument("--request", required=True)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()

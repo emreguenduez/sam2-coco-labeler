@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Launch the RoboCup labeling app from its local virtual environment.
-# Optional: ROBOCUP_DEVICE=cpu ./start_app.sh  to force the CPU instead of the Apple GPU.
+# Launch SAM2 COCO Labeler from its local virtual environment.
+# Optional: LABELER_DEVICE=cpu ./start_app.sh  to force the CPU instead of the Apple GPU.
 set -euo pipefail
 cd "$(dirname "$0")"
 if [ ! -x .venv/bin/python ]; then

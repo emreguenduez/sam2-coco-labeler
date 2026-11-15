@@ -68,7 +68,7 @@ from PyQt6.QtWidgets import (
 
 
 # Photos with a longer side than this are labeled from downscaled JPEG copies (0 disables).
-MAX_LABELING_SIDE = int(os.environ.get("ROBOCUP_MAX_SIDE", "2048"))
+MAX_LABELING_SIDE = int(os.environ.get("LABELER_MAX_SIDE", "2048"))
 AUTOSAVE_FILE_NAME = "annotations_autosave.json"
 
 IMAGE_EXTENSIONS = {
@@ -388,7 +388,7 @@ def _point_tracker_display_name(point_tracker: str) -> str:
 
 
 def _current_keypoint_tracker_backend() -> str:
-    requested_backend = os.environ.get("ROBOCUP_KEYPOINT_TRACKER", "sampt").strip().lower()
+    requested_backend = os.environ.get("LABELER_KEYPOINT_TRACKER", "sampt").strip().lower()
     if requested_backend in {"sampt", "sam-pt", "sam_pt", "sam2"}:
         return "sam2"
     if requested_backend in {"tapir", "bootstapir", "cotracker", "trackon"}:
@@ -925,7 +925,7 @@ def _build_coco_payload_for_scene(
 
     return {
         "info": {
-            "description": "RoboCup Labeling COCO export",
+            "description": "SAM2 COCO Labeler export",
             "version": "1.0",
         },
         "images": images_payload,
@@ -996,9 +996,9 @@ class OpenRouterKeypointExtractor:
         model: str | None = None,
         prompt: str | None = None,
         point_order: str | None = None,
-        model_env_var: str = "ROBOCUP_TSHIRT_KEYPOINT_MODEL",
-        prompt_env_var: str = "ROBOCUP_TSHIRT_KEYPOINT_PROMPT",
-        point_order_env_var: str = "ROBOCUP_TSHIRT_KEYPOINT_ORDER",
+        model_env_var: str = "LABELER_TSHIRT_KEYPOINT_MODEL",
+        prompt_env_var: str = "LABELER_TSHIRT_KEYPOINT_PROMPT",
+        point_order_env_var: str = "LABELER_TSHIRT_KEYPOINT_ORDER",
         default_model: str = "google/gemini-2.5-flash",
         default_prompt: str | None = None,
     ) -> None:
@@ -1172,7 +1172,7 @@ def _read_keypoint_prompt(keypoints_file: Path) -> str:
 
 
 def _keypoints_file_path() -> Path:
-    env_path = os.environ.get("ROBOCUP_KEYPOINTS_FILE", "").strip()
+    env_path = os.environ.get("LABELER_KEYPOINTS_FILE", "").strip()
     if env_path:
         return Path(env_path).expanduser()
     return Path(__file__).resolve().parent / "keypoints.txt"
@@ -1353,8 +1353,8 @@ def _run_keypoint_scene_processing_pipeline(
     keypoint_prompt = _read_keypoint_prompt(keypoints_file)
     prompt_source = str(keypoints_file)
     extractor = OpenRouterKeypointExtractor(
-        model_env_var="ROBOCUP_KEYPOINT_MODEL",
-        point_order_env_var="ROBOCUP_KEYPOINT_ORDER",
+        model_env_var="LABELER_KEYPOINT_MODEL",
+        point_order_env_var="LABELER_KEYPOINT_ORDER",
         default_model=OPENROUTER_GEMINI_3_6_FLASH_MODEL,
         prompt=keypoint_prompt,
     )
@@ -1438,7 +1438,7 @@ def _run_keypoint_scene_processing_pipeline(
             grid_step: int | None = None
             query_specs: list[tuple[int, float, float]] = []
             if use_full_image_grid:
-                grid_step = max(1, int(os.environ.get("ROBOCUP_KEYPOINT_GRID_STEP", "32")))
+                grid_step = max(1, int(os.environ.get("LABELER_KEYPOINT_GRID_STEP", "32")))
                 query_specs.extend(
                     (0, float(x_value), float(y_value))
                     for x_value, y_value in _sample_grid_points_for_image(
@@ -1449,14 +1449,14 @@ def _run_keypoint_scene_processing_pipeline(
                 )
             local_radius = max(
                 0.0,
-                float(os.environ.get("ROBOCUP_KEYPOINT_LOCAL_SAMPLE_RADIUS", "6")),
+                float(os.environ.get("LABELER_KEYPOINT_LOCAL_SAMPLE_RADIUS", "6")),
             )
             local_sample_count = max(
                 0,
-                int(os.environ.get("ROBOCUP_KEYPOINT_LOCAL_SAMPLE_COUNT", "8")),
+                int(os.environ.get("LABELER_KEYPOINT_LOCAL_SAMPLE_COUNT", "8")),
             )
             include_center = os.environ.get(
-                "ROBOCUP_KEYPOINT_LOCAL_SAMPLE_INCLUDE_CENTER",
+                "LABELER_KEYPOINT_LOCAL_SAMPLE_INCLUDE_CENTER",
                 "1",
             ).strip().lower() not in {"0", "false", "no", "off"}
             keypoint_track_assignments: list[tuple[int, list[int]]] = []
@@ -1619,7 +1619,7 @@ def _run_tshirt_scene_processing_pipeline(
             workspace_root=workspace_root,
             package_root=package_root,
         )
-        grid_step = max(1, int(os.environ.get("ROBOCUP_TSHIRT_GRID_STEP", "12")))
+        grid_step = max(1, int(os.environ.get("LABELER_TSHIRT_GRID_STEP", "12")))
         mask_messages: list[str] = []
         query_specs: list[tuple[int, float, float]] = []
         keypoint_track_assignments: list[tuple[int, int, int]] = []
@@ -1742,8 +1742,8 @@ def _run_tshirt_scene_processing_pipeline(
 
 
 def _select_torch_device(torch) -> str:
-    """Pick cuda, then Apple-Silicon mps, then cpu. Override with ROBOCUP_DEVICE."""
-    requested = os.environ.get("ROBOCUP_DEVICE", "auto").strip().lower()
+    """Pick cuda, then Apple-Silicon mps, then cpu. Override with LABELER_DEVICE."""
+    requested = os.environ.get("LABELER_DEVICE", "auto").strip().lower()
     if requested in {"cuda", "mps", "cpu"}:
         return requested
     if torch.cuda.is_available():
@@ -1872,8 +1872,8 @@ class Sam2ImageEngine:
             torch.backends.cudnn.allow_tf32 = True
 
     def _discover_model_files(self) -> tuple[str, Path, str]:
-        env_ckpt = os.environ.get("ROBOCUP_SAM2_CHECKPOINT")
-        env_cfg = os.environ.get("ROBOCUP_SAM2_CONFIG")
+        env_ckpt = os.environ.get("LABELER_SAM2_CHECKPOINT")
+        env_cfg = os.environ.get("LABELER_SAM2_CONFIG")
         if env_ckpt and env_cfg:
             ckpt_path = Path(env_ckpt)
             if ckpt_path.exists():
@@ -1924,7 +1924,7 @@ class Sam2ImageEngine:
                     return config_name, path, model_name
 
         raise RuntimeError(
-            "No SAM2 checkpoint was found. Set ROBOCUP_SAM2_CHECKPOINT and ROBOCUP_SAM2_CONFIG or place a checkpoint in the workspace."
+            "No SAM2 checkpoint was found. Set LABELER_SAM2_CHECKPOINT and LABELER_SAM2_CONFIG or place a checkpoint in the workspace."
         )
 
 
@@ -2116,8 +2116,8 @@ class Sam2VideoPropagationEngine:
         self.last_error = None
 
     def _discover_model_files(self) -> tuple[str, Path, str]:
-        env_ckpt = os.environ.get("ROBOCUP_SAM2_PLUS_CHECKPOINT")
-        env_cfg = os.environ.get("ROBOCUP_SAM2_PLUS_CONFIG")
+        env_ckpt = os.environ.get("LABELER_SAM2_PLUS_CHECKPOINT")
+        env_cfg = os.environ.get("LABELER_SAM2_PLUS_CONFIG")
         default_config = "configs/sam2.1/sam2.1_hiera_b+_predmasks_decoupled_MAME.yaml"
         if env_ckpt:
             ckpt_path = Path(env_ckpt)
@@ -2134,7 +2134,7 @@ class Sam2VideoPropagationEngine:
                 return default_config, path, path.name
 
         raise RuntimeError(
-            "No SAM2-Plus checkpoint was found. Set ROBOCUP_SAM2_PLUS_CHECKPOINT or place checkpoint_phase123.pt in a SAM2-Plus checkpoints directory."
+            "No SAM2-Plus checkpoint was found. Set LABELER_SAM2_PLUS_CHECKPOINT or place checkpoint_phase123.pt in a SAM2-Plus checkpoints directory."
         )
 
     def _ensure_cotracker_loaded(self) -> None:
@@ -2157,9 +2157,9 @@ class Sam2VideoPropagationEngine:
         checkpoint_path = self._discover_cotracker_checkpoint()
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self._configure_torch_runtime(torch, device)
-        window_len = max(1, int(os.environ.get("ROBOCUP_COTRACKER_WINDOW_LEN", "60")))
+        window_len = max(1, int(os.environ.get("LABELER_COTRACKER_WINDOW_LEN", "60")))
         visibility_threshold = float(
-            os.environ.get("ROBOCUP_COTRACKER_VISIBILITY_THRESHOLD", "0.5")
+            os.environ.get("LABELER_COTRACKER_VISIBILITY_THRESHOLD", "0.5")
         )
         predictor = CoTrackerPredictor(
             checkpoint=str(checkpoint_path),
@@ -2180,7 +2180,7 @@ class Sam2VideoPropagationEngine:
             self.torch = torch
 
     def _discover_cotracker_checkpoint(self) -> Path:
-        env_ckpt = os.environ.get("ROBOCUP_COTRACKER_CHECKPOINT")
+        env_ckpt = os.environ.get("LABELER_COTRACKER_CHECKPOINT")
         if env_ckpt:
             ckpt_path = Path(env_ckpt)
             if ckpt_path.exists():
@@ -2196,14 +2196,14 @@ class Sam2VideoPropagationEngine:
                 return path
 
         raise RuntimeError(
-            "No CoTracker checkpoint was found. Set ROBOCUP_COTRACKER_CHECKPOINT or place scaled_offline.pth in a checkpoints directory."
+            "No CoTracker checkpoint was found. Set LABELER_COTRACKER_CHECKPOINT or place scaled_offline.pth in a checkpoints directory."
         )
 
     def _tapir_model_type(self, point_tracker: str) -> str:
         return "bootstapir" if point_tracker == "bootstapir" else "tapir"
 
     def _discover_tapnet_root(self) -> Path | None:
-        env_root = os.environ.get("ROBOCUP_TAPNET_ROOT", "").strip()
+        env_root = os.environ.get("LABELER_TAPNET_ROOT", "").strip()
         if env_root:
             root_path = Path(env_root).expanduser()
             if root_path.exists():
@@ -2219,7 +2219,7 @@ class Sam2VideoPropagationEngine:
         return None
 
     def _discover_trackon_root(self) -> Path | None:
-        env_root = os.environ.get("ROBOCUP_TRACKON_ROOT", "").strip()
+        env_root = os.environ.get("LABELER_TRACKON_ROOT", "").strip()
         if env_root:
             root_path = Path(env_root).expanduser()
             if root_path.exists():
@@ -2235,7 +2235,7 @@ class Sam2VideoPropagationEngine:
         return None
 
     def _discover_trackon_checkpoint(self) -> Path:
-        env_ckpt = os.environ.get("ROBOCUP_TRACKON_CHECKPOINT", "").strip()
+        env_ckpt = os.environ.get("LABELER_TRACKON_CHECKPOINT", "").strip()
         if env_ckpt:
             ckpt_path = Path(env_ckpt).expanduser()
             if ckpt_path.exists():
@@ -2263,12 +2263,12 @@ class Sam2VideoPropagationEngine:
                 return path
 
         raise RuntimeError(
-            "No Track-On checkpoint was found. Set ROBOCUP_TRACKON_CHECKPOINT "
+            "No Track-On checkpoint was found. Set LABELER_TRACKON_CHECKPOINT "
             "or place track_on_r.pt / trackon2_dinov3_checkpoint.pt in track_on/checkpoints."
         )
 
     def _discover_trackon_config(self) -> Path | None:
-        env_config = os.environ.get("ROBOCUP_TRACKON_CONFIG", "").strip()
+        env_config = os.environ.get("LABELER_TRACKON_CONFIG", "").strip()
         if env_config:
             config_path = Path(env_config).expanduser()
             if config_path.exists():
@@ -2281,7 +2281,7 @@ class Sam2VideoPropagationEngine:
         return config_path if config_path.exists() else None
 
     def _discover_trackon_python(self) -> Path | None:
-        env_python = os.environ.get("ROBOCUP_TRACKON_PYTHON", "").strip()
+        env_python = os.environ.get("LABELER_TRACKON_PYTHON", "").strip()
         if env_python:
             return Path(env_python).expanduser()
 
@@ -2313,7 +2313,7 @@ class Sam2VideoPropagationEngine:
             self.trackon_last_error = str(exc)
             raise RuntimeError(
                 "Could not import Track-On. Install the Track-On runtime dependencies "
-                "and set ROBOCUP_TRACKON_ROOT to the local track_on checkout. "
+                "and set LABELER_TRACKON_ROOT to the local track_on checkout. "
                 f"Import error: {exc}"
             ) from exc
 
@@ -2322,7 +2322,7 @@ class Sam2VideoPropagationEngine:
         model_args = load_args_from_yaml(str(config_path)) if config_path is not None else None
         support_grid_size = max(
             0,
-            int(os.environ.get("ROBOCUP_TRACKON_SUPPORT_GRID_SIZE", "0")),
+            int(os.environ.get("LABELER_TRACKON_SUPPORT_GRID_SIZE", "0")),
         )
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self._configure_torch_runtime(torch, device)
@@ -2351,9 +2351,9 @@ class Sam2VideoPropagationEngine:
 
     def _discover_tapir_checkpoint(self, model_type: str) -> Path:
         env_name = (
-            "ROBOCUP_BOOTSTAPIR_CHECKPOINT"
+            "LABELER_BOOTSTAPIR_CHECKPOINT"
             if model_type == "bootstapir"
-            else "ROBOCUP_TAPIR_CHECKPOINT"
+            else "LABELER_TAPIR_CHECKPOINT"
         )
         env_ckpt = os.environ.get(env_name, "").strip()
         if env_ckpt:
@@ -2384,12 +2384,12 @@ class Sam2VideoPropagationEngine:
 
         if model_type == "bootstapir":
             hint = (
-                "Set ROBOCUP_BOOTSTAPIR_CHECKPOINT or download "
+                "Set LABELER_BOOTSTAPIR_CHECKPOINT or download "
                 "bootstapir_checkpoint_v2.npy into tapnet/checkpoints."
             )
         else:
             hint = (
-                "Set ROBOCUP_TAPIR_CHECKPOINT or download "
+                "Set LABELER_TAPIR_CHECKPOINT or download "
                 "tapir_checkpoint_panning.npy into tapnet/checkpoints."
             )
         raise RuntimeError(f"No {model_type} checkpoint was found. {hint}")
@@ -2411,7 +2411,7 @@ class Sam2VideoPropagationEngine:
             self.tapir_last_error = str(exc)
             raise RuntimeError(
                 "Could not import TapNet/TAPIR. Install the official tapnet package "
-                "and its JAX dependencies, or set ROBOCUP_TAPNET_ROOT to a local checkout. "
+                "and its JAX dependencies, or set LABELER_TAPNET_ROOT to a local checkout. "
                 f"Import error: {exc}"
             ) from exc
 
@@ -2491,18 +2491,18 @@ class Sam2VideoPropagationEngine:
         python_path: Path,
     ) -> tuple[np.ndarray, np.ndarray]:
         if not python_path.exists():
-            raise RuntimeError(f"ROBOCUP_TRACKON_PYTHON does not exist: {python_path}")
+            raise RuntimeError(f"LABELER_TRACKON_PYTHON does not exist: {python_path}")
 
         trackon_root = self._discover_trackon_root()
         if trackon_root is None:
             raise RuntimeError(
-                "No Track-On checkout was found. Set ROBOCUP_TRACKON_ROOT."
+                "No Track-On checkout was found. Set LABELER_TRACKON_ROOT."
             )
         checkpoint_path = self._discover_trackon_checkpoint()
         config_path = self._discover_trackon_config()
         support_grid_size = max(
             0,
-            int(os.environ.get("ROBOCUP_TRACKON_SUPPORT_GRID_SIZE", "0")),
+            int(os.environ.get("LABELER_TRACKON_SUPPORT_GRID_SIZE", "0")),
         )
         helper_path = Path(__file__).resolve().parent / "trackon_subprocess.py"
         if not helper_path.exists():
@@ -2518,9 +2518,9 @@ class Sam2VideoPropagationEngine:
             "checkpoint_path": str(checkpoint_path),
             "config_path": str(config_path) if config_path is not None else None,
             "support_grid_size": support_grid_size,
-            "device": os.environ.get("ROBOCUP_TRACKON_DEVICE", "auto").strip().lower(),
+            "device": os.environ.get("LABELER_TRACKON_DEVICE", "auto").strip().lower(),
         }
-        with tempfile.TemporaryDirectory(prefix="robocup_trackon_") as temp_dir:
+        with tempfile.TemporaryDirectory(prefix="labeler_trackon_") as temp_dir:
             request_path = Path(temp_dir) / "request.json"
             output_path = Path(temp_dir) / "tracks.npz"
             request_path.write_text(json.dumps(request_payload), encoding="utf-8")
@@ -2530,7 +2530,7 @@ class Sam2VideoPropagationEngine:
                 if env.get("PYTHONPATH")
                 else str(trackon_root)
             )
-            timeout_seconds = float(os.environ.get("ROBOCUP_TRACKON_TIMEOUT", "0"))
+            timeout_seconds = float(os.environ.get("LABELER_TRACKON_TIMEOUT", "0"))
             completed = subprocess.run(
                 [
                     str(python_path),
@@ -2668,13 +2668,13 @@ class Sam2VideoPropagationEngine:
         default_resolution = "512" if model_type == "bootstapir" else "256"
         resize_height = max(
             1,
-            int(os.environ.get("ROBOCUP_TAPIR_RESIZE_HEIGHT", os.environ.get("ROBOCUP_TAPIR_RESOLUTION", default_resolution))),
+            int(os.environ.get("LABELER_TAPIR_RESIZE_HEIGHT", os.environ.get("LABELER_TAPIR_RESOLUTION", default_resolution))),
         )
         resize_width = max(
             1,
-            int(os.environ.get("ROBOCUP_TAPIR_RESIZE_WIDTH", os.environ.get("ROBOCUP_TAPIR_RESOLUTION", default_resolution))),
+            int(os.environ.get("LABELER_TAPIR_RESIZE_WIDTH", os.environ.get("LABELER_TAPIR_RESOLUTION", default_resolution))),
         )
-        query_chunk_size = max(1, int(os.environ.get("ROBOCUP_TAPIR_QUERY_CHUNK_SIZE", "32")))
+        query_chunk_size = max(1, int(os.environ.get("LABELER_TAPIR_QUERY_CHUNK_SIZE", "32")))
         resample_filter = getattr(Image, "Resampling", Image).BILINEAR
         resized_frames = [
             np.array(
@@ -3924,7 +3924,7 @@ class SceneTaskListItemWidget(QWidget):
 class LabelingWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("RoboCup Labeling")
+        self.setWindowTitle("SAM2 COCO Labeler")
         self.resize(1520, 940)
         self.setMinimumSize(1180, 760)
 
@@ -4274,7 +4274,7 @@ class LabelingWindow(QMainWindow):
         header_layout.setSpacing(12)
 
         title_block = QVBoxLayout()
-        title = QLabel("RoboCup Labeling")
+        title = QLabel("SAM2 COCO Labeler")
         title.setObjectName("appTitle")
         subtitle = QLabel(
             "Supports automatic object and keypoint annotation and label propagation through video."
@@ -5279,7 +5279,7 @@ class LabelingWindow(QMainWindow):
 
         return {
             "info": {
-                "description": "RoboCup Labeling COCO export",
+                "description": "SAM2 COCO Labeler export",
                 "version": "1.0",
             },
             "images": images_payload,
@@ -5288,7 +5288,7 @@ class LabelingWindow(QMainWindow):
         }
 
     def _apply_default_scene_watch_root(self) -> None:
-        env_root = os.environ.get("ROBOCUP_SCENE_WATCH_ROOT")
+        env_root = os.environ.get("LABELER_SCENE_WATCH_ROOT")
         if not env_root:
             return
         root_path = Path(env_root).expanduser()
@@ -5338,7 +5338,7 @@ class LabelingWindow(QMainWindow):
         classes_file: Path | None = None
         class_specs: list[VocabularyClassSpec] = []
         if autolabel_mode == "objects":
-            classes_file = self.app_root / "robocup_labeling_app" / "classes.txt"
+            classes_file = self.app_root / "sam2_coco_labeler" / "classes.txt"
             class_specs = self._parse_scene_classes_file(classes_file)
             if not classes_file.exists() or not class_specs:
                 QMessageBox.warning(
@@ -5409,7 +5409,7 @@ class LabelingWindow(QMainWindow):
         classes_file: Path | None = None
         class_specs: list[VocabularyClassSpec] = []
         if autolabel_mode == "objects":
-            classes_file = self.app_root / "robocup_labeling_app" / "classes.txt"
+            classes_file = self.app_root / "sam2_coco_labeler" / "classes.txt"
             if not classes_file.exists():
                 self.scene_watch_result_label.setText(
                     f"Detector hook: waiting for app classes file at {classes_file}"
@@ -7447,7 +7447,7 @@ class LabelingWindow(QMainWindow):
             self,
             "About",
             (
-                "RoboCup Labeling\n"
+                "SAM2 COCO Labeler\n"
                 "A lightweight X-AnyLabeling-inspired starter app with SAM2 prompt segmentation "
                 "and a task-selection timeline."
             ),
